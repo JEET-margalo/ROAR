@@ -1,0 +1,82 @@
+# ROAR Configuration Sample
+# Copy this file to roar.yaml and fill in your actual values
+
+# API Keys for various services
+WORDPRESS: [""]
+bevigil: [""]
+binaryedge: [""]
+urlscan: [""]
+bufferoverflow: [""]
+c99: [""]
+censys: [""]
+certspotter: [""]
+chaos: [""]
+chinaz: [""]
+dnsdb: [""]
+fofa: [""]
+fullhunt: [""]
+github: [""]
+intelx: [""]
+passivetotal: [""]
+quake: [""]
+robtex: [""]
+securitytrails: [""]
+shodan: [""]
+threatbook: [""]
+virustotal: [""]
+whoisxmlapi: [""]
+zoomeye: [""]
+zoomeyeapi: [""]
+dnsrepo: [""]
+hunter: [""]
+
+# Additional API Keys
+H1_API_KEY: ""
+INTEGRITI_API_KEY: ""
+openrouter_api: ""
+
+# Database Configuration
+SAVE_TO_DB: true
+VERBOSE: false
+# Database Type: "postgresql" or "sqlite"
+DB_TYPE: "postgresql"
+# For PostgreSQL: use connection string or individual variables
+DB_HOST: "postgresql://user:password@host:port/database"
+# For PostgreSQL: individual variables (alternative to connection string)
+# DB_HOST: "localhost"
+# DB_PORT: 5432
+# DB_USER: "roar"
+# DB_PASSWORD: "password"
+DB_NAME: "bughunt"
+# For SQLite: DB_HOST should be the file path (e.g., "./bughunt.db" or "/path/to/bughunt.db")
+# DB_TYPE: "sqlite"
+# DB_HOST: "./bughunt.db"
+DOMAINS_COLLECTION: "domains"
+SUBDOMAINS_COLLECTION: "subdomains"
+
+
+# Tool configuration
+tools:
+  nuclei:
+    templates_path: "/srv/nuclei_templates"
+    rate_limit: 150
+    concurrency: 25
+  
+  ffuf:
+    wordlist_path: "/srv/Wordlists/quick_fuzz.txt"
+    threads: 50
+  
+  subfinder:
+    config_path: "/srv/config/roar.yaml"
+    threads: 10
+  
+  github_scan:
+    max_repos: 50
+    parallel_jobs: 3
+    html_reports: true
+    scan_types: ["github_org_scan"]
+
+# Storage configuration
+storage:
+  type: "local"
+  local_path: "/srv/results"

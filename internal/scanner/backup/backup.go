@@ -1,0 +1,270 @@
+package backup
+
+import (
+	"bufio"
+	"fmt"
+	"github.com/h0tak88r/ROAR/internal/logger"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	fuzzulitool "github.com/h0tak88r/ROAR/internal/tools/fuzzuli"
+	"github.com/h0tak88r/ROAR/internal/utils"
+)
+
+// Options controls how the backup scan runs.
+// This is a Go port of modules/backup_scan.sh (domain / live-hosts modes only).
+type Options struct {
+	Domain        string
+	LiveHostsFile string
+	OutputDir     string
+	Threads       int
+	DelayMS       int
+	Method        string   // Fuzzuli method: regular, withoutdots, withoutvowels, reverse, mixed, withoutdv, shuffle, all
+	Extensions    []string // Custom file extensions (e.g., [".rar", ".zip"])
+}
+
+type Result struct {
+	OutputDir      string
+	ResultsFile    string
+	LogFile        string
+	FoundCount     int
+	Duration       time.Duration
+	LiveHostsCount int
+}
+
+// Run executes the backup scan using the embedded fuzzuli engine.
+func Run(opts Options) (*Result, error) {
+	// Allow both Domain and LiveHostsFile - Domain is used for output directory, LiveHostsFile for input
+	if opts.LiveHostsFile == "" && opts.Domain == "" {
+		return nil, fmt.Errorf("either Domain or LiveHostsFile must be provided")
+	}
+
+	logger.GetLogger().Infof("[DEBUG] Backup Run Options: Domain='%s', LiveHostsFile='%s', OutputDir='%s'", opts.Domain, opts.LiveHostsFile, opts.OutputDir)
+
+	resultsDir := os.Getenv("ROAR_RESULTS_DIR")
+	if resultsDir == "" {
+		resultsDir = "new-results"
+	}
+
+	// Normalize results directory path - if absolute path at root and not in Docker, convert to relative
+	if filepath.IsAbs(resultsDir) && !strings.HasPrefix(resultsDir, "/app") {
+		// Check if we're in Docker
+		isDocker := false
+		if _, err := os.Stat("/app"); err == nil {
+			if err := os.MkdirAll("/app", 0755); err == nil {
+				testPath := "/app/.test-write"
+				if f, err := os.Create(testPath); err == nil {
+					f.Close()
+					os.Remove(testPath)
+					isDocker = true
+				}
+			}
+		}
+
+		// If not in Docker and path is absolute (like /new-results), convert to relative
+		if !isDocker {
+			if cwd, err := os.Getwd(); err == nil {
+				resultsDir = filepath.Join(cwd, "new-results")
+			} else {
+				resultsDir = "new-results"
+			}
+		}
+	}
+
+	// Determine output directory
+	outDir := opts.OutputDir
+	if outDir == "" {
+		if opts.Domain != "" {
+			// Sanitize domain into a single safe path segment (prevents traversal
+			// via a crafted target such as "../../etc").
+			sanitizedDomain := utils.SanitizeTargetSegment(opts.Domain)
+			outDir = filepath.Join(resultsDir, sanitizedDomain, "backup")
+		} else {
+			outDir = filepath.Join(resultsDir, "backup")
+		}
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create output directory %s: %w", outDir, err)
+	}
+
+	resultsFile := filepath.Join(outDir, "fuzzuli-results.txt")
+	logFile := filepath.Join(outDir, "fuzzuli-output.log")
+
+	res := &Result{
+		OutputDir:   outDir,
+		ResultsFile: resultsFile,
+		LogFile:     logFile,
+	}
+
+	resultsFH, err := os.Create(resultsFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create results file: %w", err)
+	}
+	defer resultsFH.Close()
+
+	logFH, err := os.Create(logFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log file: %w", err)
+	}
+	defer logFH.Close()
+
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = 100
+	}
+
+	fuzzOpts := fuzzulitool.DefaultOptions()
+	fuzzOpts.Workers = threads
+
+	// Set method if provided
+	if opts.Method != "" {
+		fuzzOpts.Method = fuzzulitool.Method(opts.Method)
+	}
+
+	// Set custom extensions if provided
+	if len(opts.Extensions) > 0 {
+		fuzzOpts.Extensions = opts.Extensions
+	}
+
+	start := time.Now()
+
+	// Set default method to "all" if not specified
+	if opts.Method == "" {
+		opts.Method = "all"
+		fuzzOpts.Method = fuzzulitool.MethodAll
+	}
+
+	var urls []string
+	// Prioritize LiveHostsFile over Domain when both are provided
+	switch {
+	case opts.LiveHostsFile != "":
+		logger.GetLogger().Infof("[INFO] Backup scan: Reading live hosts from file: %s", opts.LiveHostsFile)
+		// Count hosts in file for logging
+		if lf, err := os.Open(opts.LiveHostsFile); err == nil {
+			ls := bufio.NewScanner(lf)
+			hostCount := 0
+			for ls.Scan() {
+				if strings.TrimSpace(ls.Text()) != "" {
+					hostCount++
+				}
+			}
+			lf.Close()
+			logger.GetLogger().Infof("[INFO] Backup scan: Found %d live host(s) in file", hostCount)
+		}
+		logger.GetLogger().Infof("[INFO] Backup scan: Scanning live hosts with method %s, threads %d", opts.Method, threads)
+		if len(opts.Extensions) > 0 {
+			logger.GetLogger().Infof("[INFO] Backup scan: Using custom extensions: %v", opts.Extensions)
+		}
+		u, err := fuzzulitool.ScanFromFile(opts.LiveHostsFile, fuzzOpts)
+		if err != nil {
+			return res, fmt.Errorf("fuzzuli scan failed: %w", err)
+		}
+		urls = u
+		logger.GetLogger().Infof("[INFO] Backup scan: Generated %d backup file URLs from live hosts", len(urls))
+	case opts.Domain != "":
+		logger.GetLogger().Infof("[INFO] Backup scan: Scanning domain %s with method %s, threads %d", opts.Domain, opts.Method, threads)
+		if len(opts.Extensions) > 0 {
+			logger.GetLogger().Infof("[INFO] Backup scan: Using custom extensions: %v", opts.Extensions)
+		}
+		u, err := fuzzulitool.ScanDomain(opts.Domain, fuzzOpts)
+		if err != nil {
+			return res, fmt.Errorf("fuzzuli scan failed: %w", err)
+		}
+		urls = u
+		logger.GetLogger().Infof("[INFO] Backup scan: Generated %d backup file URLs for domain %s", len(urls), opts.Domain)
+		if len(urls) > 0 {
+			logger.GetLogger().Infof("[DEBUG] Backup scan: Sample URLs found: %v", urls[:min(5, len(urls))])
+		}
+	default:
+		return nil, fmt.Errorf("invalid options")
+	}
+
+	validURLs := make([]string, 0, len(urls))
+	foundCount := 0
+	for _, u := range urls {
+		if strings.TrimSpace(u) == "" {
+			continue
+		}
+		if _, err := resultsFH.WriteString(u + "\n"); err == nil {
+			validURLs = append(validURLs, u)
+			foundCount++
+		}
+	}
+
+	logger.GetLogger().Infof("[INFO] Backup scan: Wrote %d backup URLs to results file: %s", foundCount, resultsFile)
+
+	res.Duration = time.Since(start)
+
+	// We already have discovered URLs from the fuzzuli package result.
+	res.FoundCount = foundCount
+
+	// If we scanned a live-hosts file, record host count as well.
+	if opts.LiveHostsFile != "" {
+		if lf, err := os.Open(opts.LiveHostsFile); err == nil {
+			defer lf.Close()
+			ls := bufio.NewScanner(lf)
+			for ls.Scan() {
+				if strings.TrimSpace(ls.Text()) != "" {
+					res.LiveHostsCount++
+				}
+			}
+		}
+	}
+
+	// Write structured JSON for the dashboard — one finding per discovered backup URL.
+	// template-id = "Exposed Backup File", matched-at = URL, severity = high
+	if scanID := utils.GetCurrentScanID(); scanID != "" {
+		type backupFinding struct {
+			TemplateID string `json:"template-id"`
+			MatchedAt  string `json:"matched-at"`
+			Severity   string `json:"severity"`
+			Module     string `json:"module"`
+		}
+		findings := make([]backupFinding, 0, len(validURLs))
+		for _, l := range validURLs {
+			if strings.TrimSpace(l) == "" || !strings.Contains(l, "http") {
+				continue
+			}
+			findings = append(findings, backupFinding{
+				TemplateID: "Exposed Backup File",
+				MatchedAt:  l,
+				Severity:   "high",
+				Module:     "backup-detection",
+			})
+		}
+		if len(findings) > 0 {
+			if err := utils.WriteJSONToScanDir(scanID, "backup-vulnerabilities.json", findings); err != nil {
+				logger.GetLogger().Infof("[WARN] Failed to write backup JSON: %v", err)
+			}
+		} else {
+			_ = utils.WriteNoFindingsJSON(scanID, opts.Domain, "backup-detection", "backup-vulnerabilities.json")
+		}
+	}
+
+	return res, nil
+}
+
+// sanitizeDomainForPath removes protocol and sanitizes domain for use in filesystem paths
+func sanitizeDomainForPath(domain string) string {
+	domain = strings.TrimSpace(domain)
+	// Remove protocol if present
+	if strings.HasPrefix(domain, "http://") {
+		domain = strings.TrimPrefix(domain, "http://")
+	} else if strings.HasPrefix(domain, "https://") {
+		domain = strings.TrimPrefix(domain, "https://")
+	}
+	// Replace any remaining colons (e.g., from ports) with dashes
+	domain = strings.ReplaceAll(domain, ":", "-")
+	// Remove trailing slashes
+	domain = strings.TrimRight(domain, "/")
+	return domain
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

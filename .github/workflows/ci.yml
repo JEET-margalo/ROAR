@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: CGO_ENABLED=1 go vet ./...
+
+      - name: Test
+        run: CGO_ENABLED=1 go test ./...
+
+      - name: Build
+        run: |
+          CGO_ENABLED=1 go build -o roar ./cmd/roar
+          chmod +x roar
+          echo "Build successful!"
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: '-no-fail -fmt json -out gosec-report.json ./...'
+
+      - name: Upload Gosec results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gosec-report
+          path: gosec-report.json
+

@@ -1,0 +1,1117 @@
+package s3
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"github.com/h0tak88r/ROAR/internal/logger"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/sa7mon/s3scanner/bucket"
+	"github.com/sa7mon/s3scanner/provider"
+	"github.com/h0tak88r/ROAR/internal/utils"
+)
+
+// Options for s3 commands
+type Options struct {
+	Bucket   string
+	Root     string
+	Region   string
+	Action   string // "scan", "enum"
+	Verbose  bool
+	Threads  int    // Number of concurrent threads for enumeration (default: 50)
+	Subdomain string // Subdomain for directory structure (optional)
+}
+
+// Run executes s3 command based on action
+func Run(opts Options) error {
+	if opts.Action == "" {
+		// API launcher submits only bucket/region for /scan/s3, so default to scan.
+		opts.Action = "scan"
+	}
+
+	resultsDir := os.Getenv("ROAR_RESULTS_DIR")
+	if resultsDir == "" {
+		resultsDir = "new-results"
+	}
+
+	switch opts.Action {
+	case "enum":
+		return handleEnum(opts, resultsDir)
+	case "scan":
+		return handleScan(opts, resultsDir)
+	case "domain":
+		return handleDomainEnumAndScan(opts, resultsDir)
+	default:
+		return fmt.Errorf("unknown action: %s", opts.Action)
+	}
+}
+
+// bucketResult holds the result of testing a single bucket
+type bucketResult struct {
+	bucketName string
+	found      bool
+	url        string
+}
+
+// handleDomainEnumAndScan enumerates buckets from a domain, then scans each found bucket.
+func handleDomainEnumAndScan(opts Options, resultsDir string) error {
+	if opts.Root == "" {
+		return fmt.Errorf("root domain is required for domain action")
+	}
+	domain := opts.Root
+
+	// Directory structure: resultsDir/domain/s3/
+	outputDir := filepath.Join(resultsDir, utils.SanitizeTargetSegment(domain), "s3")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	bucketsFile := filepath.Join(outputDir, "buckets.txt")
+	logFile := filepath.Join(outputDir, "domain-scan.log")
+
+	logger.GetLogger().Infof("[S3] Domain scan: starting for domain %s", domain)
+
+	logFileHandle, err := os.Create(logFile)
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %v", err)
+	}
+	defer logFileHandle.Close()
+
+	// ── Step 1: Enumerate bucket names ──────────────────────────────────────
+	bucketPatterns := generateBucketNames(domain)
+	fmt.Fprintf(logFileHandle, "[INFO] Generated %d bucket name patterns from domain %s\n", len(bucketPatterns), domain)
+	logger.GetLogger().Infof("[S3] Domain scan: generated %d bucket name patterns from %s", len(bucketPatterns), domain)
+
+	storageProvider, err := provider.NewProvider("aws")
+	if err != nil {
+		return fmt.Errorf("failed to create S3Scanner provider: %w", err)
+	}
+
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = 50
+	}
+
+	// Enumerate: check which buckets exist
+	type enumResult struct {
+		name   string
+		region string
+	}
+	var mu sync.Mutex
+	var foundBuckets []enumResult
+
+	bucketsChan := make(chan bucket.Bucket, threads)
+	var enumWg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		enumWg.Add(1)
+		go func() {
+			defer enumWg.Done()
+			for b := range bucketsChan {
+				result, err := storageProvider.BucketExists(&b)
+				if err != nil {
+					continue
+				}
+				_ = storageProvider.Scan(result, false)
+				if result.Exists == bucket.BucketExists {
+					mu.Lock()
+					foundBuckets = append(foundBuckets, enumResult{name: result.Name, region: result.Region})
+					mu.Unlock()
+					logger.GetLogger().Infof("[S3] Domain scan: found bucket %s (region: %s)", result.Name, result.Region)
+				}
+			}
+		}()
+	}
+
+	for _, name := range bucketPatterns {
+		b := bucket.NewBucket(name)
+		bucketsChan <- b
+	}
+	close(bucketsChan)
+	enumWg.Wait()
+
+	fmt.Fprintf(logFileHandle, "[INFO] Enumeration complete: found %d bucket(s) out of %d tested\n", len(foundBuckets), len(bucketPatterns))
+
+	// Write discovered buckets to buckets.txt
+	if bw, err := os.Create(bucketsFile); err == nil {
+		for _, fb := range foundBuckets {
+			fmt.Fprintln(bw, fb.name)
+		}
+		bw.Close()
+	}
+
+	if len(foundBuckets) == 0 {
+		fmt.Fprintf(logFileHandle, "[INFO] No buckets discovered for domain %s\n", domain)
+		logger.GetLogger().Infof("[S3] Domain scan: no buckets discovered for %s", domain)
+
+		// Still publish a no-findings result so the UI shows the scan completed
+		if scanID := utils.GetCurrentScanID(); scanID != "" {
+			_ = utils.WriteNoFindingsJSON(scanID, domain, "s3-scan", "s3-vulnerabilities.json")
+		}
+		fmt.Printf("[OK] S3 domain scan completed for %s — no buckets found.\n", domain)
+		return nil
+	}
+
+	// ── Step 2: Scan each discovered bucket ─────────────────────────────────
+	type bucketFinding struct {
+		Target      string `json:"target"`
+		Bucket      string `json:"bucket"`
+		Status      string `json:"status"`
+		Vulnerable  bool   `json:"vulnerable"`
+		Severity    string `json:"severity"`
+		Module      string `json:"module"`
+		Finding     string `json:"finding"`
+		ObjectCount int    `json:"object_count"`
+		ScanMethod  string `json:"scan_method"`
+		CanList     bool   `json:"can_list"`
+		CanRead     bool   `json:"can_read"`
+		CanWrite    bool   `json:"can_write"`
+		CanDelete   bool   `json:"can_delete"`
+	}
+	var allFindings []bucketFinding
+
+	for _, fb := range foundBuckets {
+		logger.GetLogger().Infof("[S3] Domain scan: scanning bucket %s", fb.name)
+		fmt.Fprintf(logFileHandle, "\n--- Scanning bucket: %s (region: %s) ---\n", fb.name, fb.region)
+
+		// Permission probe
+		permList, permRead, permWrite, permDelete := probeBucketPermissions(fb.name, fb.region, logFileHandle)
+
+		// Try public object listing
+		objectCount := 0
+		scanMethod := "unauthenticated (restricted)"
+		region := fb.region
+		if region == "" {
+			region = opts.Region
+		}
+		regions := []string{"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-south-1", "eu-central-1"}
+		if region != "" {
+			regions = []string{region}
+		}
+	out:
+		for _, r := range regions {
+			urls := bucketListURLs(fb.name, r)
+			for _, u := range urls {
+				bucketDir := filepath.Join(outputDir, fb.name)
+				_ = os.MkdirAll(bucketDir, 0755)
+				bucketOut := filepath.Join(bucketDir, "scan-results.txt")
+				outF, err := os.Create(bucketOut)
+				if err != nil {
+					continue
+				}
+				objects := scanBucketPublicAccess(u, fb.name, outF, logFileHandle)
+				outF.Close()
+				if len(objects) > 0 {
+					objectCount = len(objects)
+					scanMethod = "unauthenticated (public)"
+					break out
+				}
+			}
+		}
+
+		if permWrite && scanMethod == "unauthenticated (restricted)" {
+			scanMethod = "unauthenticated (writeable)"
+		}
+
+		severity := "info"
+		status := "restricted"
+		if permWrite {
+			severity = "critical"
+			status = "public-write"
+		} else if permList || permRead {
+			severity = "high"
+			status = "public-read"
+		}
+
+		allFindings = append(allFindings, bucketFinding{
+			Target:      fmt.Sprintf("https://%s.s3.amazonaws.com", fb.name),
+			Bucket:      fb.name,
+			Status:      status,
+			Vulnerable:  permList || permRead || permWrite || permDelete || objectCount > 0,
+			Severity:    severity,
+			Module:      "s3-scan",
+			Finding:     fmt.Sprintf("S3 bucket permission exposure (%s)", scanMethod),
+			ObjectCount: objectCount,
+			ScanMethod:  scanMethod,
+			CanList:     permList,
+			CanRead:     permRead,
+			CanWrite:    permWrite,
+			CanDelete:   permDelete,
+		})
+	}
+
+	// ── Step 3: Write results ───────────────────────────────────────────────
+	if scanID := utils.GetCurrentScanID(); scanID != "" {
+		if len(allFindings) > 0 {
+			if err := utils.WriteJSONToScanDir(scanID, "s3-vulnerabilities.json", allFindings); err != nil {
+				logger.GetLogger().Infof("[WARN] Failed to write S3 domain scan JSON: %v", err)
+			}
+			// Also write bucket discoveries as findings
+			discoveries := make([]map[string]string, 0, len(foundBuckets))
+			for _, fb := range foundBuckets {
+				discoveries = append(discoveries, map[string]string{
+					"target": fb.name,
+					"bucket": fb.name,
+					"status": "discovered",
+					"severity": "info",
+					"module": "s3-scan",
+					"finding": fmt.Sprintf("S3 bucket discovered via domain enumeration (%s)", domain),
+				})
+			}
+			_ = utils.WriteJSONToScanDir(scanID, "s3-buckets.json", discoveries)
+		} else {
+			_ = utils.WriteNoFindingsJSON(scanID, domain, "s3-scan", "s3-vulnerabilities.json")
+		}
+	}
+
+	fmt.Printf("[OK] S3 domain scan completed for %s\n", domain)
+	fmt.Printf("[INFO] Buckets discovered: %d\n", len(foundBuckets))
+	vulnCount := 0
+	for _, f := range allFindings {
+		if f.Vulnerable {
+			vulnCount++
+		}
+	}
+	fmt.Printf("[INFO] Vulnerable buckets: %d\n", vulnCount)
+	fmt.Printf("[INFO] Results saved to: %s\n", outputDir)
+	logger.GetLogger().Infof("[OK] S3 domain scan completed for %s (buckets: %d, vulnerable: %d, output: %s)", domain, len(foundBuckets), vulnCount, outputDir)
+
+	return nil
+}
+
+func handleEnum(opts Options, resultsDir string) error {
+	if opts.Root == "" {
+		return fmt.Errorf("root domain is required for enum action")
+	}
+
+	// Use Subdomain for directory structure if provided, otherwise use root domain
+	var outputDir string
+	if opts.Subdomain != "" {
+		outputDir = filepath.Join(resultsDir, utils.SanitizeTargetSegment(opts.Subdomain), "s3")
+	} else {
+		outputDir = filepath.Join(resultsDir, "s3", utils.SanitizeTargetSegment(opts.Root))
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	outputFile := filepath.Join(outputDir, "buckets.txt")
+	logFile := filepath.Join(outputDir, "enum.log")
+
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Starting enumeration for root domain: %s", opts.Root)
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Output directory: %s", outputDir)
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Results will be saved to: %s", outputFile)
+
+	// Use S3Scanner package for enumeration
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Using S3Scanner package for enumeration")
+	
+	// Generate bucket name patterns
+	bucketPatterns := generateBucketNames(opts.Root)
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Generated %d bucket name patterns to test", len(bucketPatterns))
+	
+	// Create output files
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer outFile.Close()
+
+	logFileHandle, err := os.Create(logFile)
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %v", err)
+	}
+	defer logFileHandle.Close()
+
+	// Create S3Scanner provider (AWS by default)
+	storageProvider, err := provider.NewProvider("aws")
+	if err != nil {
+		return fmt.Errorf("failed to create S3Scanner provider: %w", err)
+	}
+
+	// Set up threading
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = 50 // Default to 50 concurrent requests
+	}
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Using %d concurrent threads for bucket testing", threads)
+
+	// Create channels for bucket processing
+	bucketsChan := make(chan bucket.Bucket, threads)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	foundCount := 0
+	foundBuckets := make([]string, 0, 32)
+
+	// Start worker goroutines using S3Scanner worker
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Process buckets using S3Scanner worker
+			for b := range bucketsChan {
+				// Check if bucket exists
+				result, err := storageProvider.BucketExists(&b)
+				if err != nil {
+					if opts.Verbose {
+						fmt.Fprintf(logFileHandle, "[ERROR] Error checking bucket %s: %v\n", b.Name, err)
+					}
+					continue
+				}
+
+				// Scan permissions
+				scanErr := storageProvider.Scan(result, false)
+				if scanErr != nil && opts.Verbose {
+					fmt.Fprintf(logFileHandle, "[WARN] Error scanning bucket %s: %v\n", result.Name, scanErr)
+				}
+
+				// Write results
+				if result.Exists == bucket.BucketExists {
+					mu.Lock()
+					if _, werr := fmt.Fprintf(outFile, "%s\n", result.Name); werr != nil {
+						mu.Unlock()
+						logger.GetLogger().Infof("[ERROR] Failed to write bucket name: %v", werr)
+						continue
+					}
+					fmt.Fprintf(logFileHandle, "[OK] Found bucket: %s (region: %s)\n", result.Name, result.Region)
+					logger.GetLogger().Infof("[OK] S3 enumeration: Found bucket: %s (region: %s)", result.Name, result.Region)
+					foundCount++
+					foundBuckets = append(foundBuckets, result.Name)
+					mu.Unlock()
+				} else if opts.Verbose {
+					fmt.Fprintf(logFileHandle, "[INFO] Bucket %s: does not exist\n", result.Name)
+				}
+			}
+		}()
+	}
+
+	// Send bucket names to workers
+	go func() {
+		for _, bucketName := range bucketPatterns {
+			b := bucket.NewBucket(bucketName)
+			bucketsChan <- b
+		}
+		close(bucketsChan)
+	}()
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	logger.GetLogger().Infof("[INFO] S3 enumeration: Found %d bucket(s) out of %d tested", foundCount, len(bucketPatterns))
+	fmt.Printf("[OK] S3 enumeration completed for %s\n", opts.Root)
+	fmt.Printf("[INFO] Buckets found: %d out of %d tested\n", foundCount, len(bucketPatterns))
+	fmt.Printf("[INFO] Results saved to: %s\n", outputFile)
+	fmt.Printf("[INFO] Log saved to: %s\n", logFile)
+	
+	logger.GetLogger().Infof("[OK] S3 enumeration completed for %s (results: %s, log: %s)", opts.Root, outputFile, logFile)
+
+	// Publish structured enum results for dashboard parsing.
+	if scanID := utils.GetCurrentScanID(); scanID != "" {
+		type s3EnumFinding struct {
+			Target     string `json:"target"`
+			Bucket     string `json:"bucket"`
+			Status     string `json:"status"`
+			Vulnerable bool   `json:"vulnerable"`
+			Severity   string `json:"severity"`
+			Module     string `json:"module"`
+			Finding    string `json:"finding"`
+		}
+		findings := make([]s3EnumFinding, 0, len(foundBuckets))
+		for _, b := range foundBuckets {
+			findings = append(findings, s3EnumFinding{
+				Target:     b,
+				Bucket:     b,
+				Status:     "discovered",
+				Vulnerable: false,
+				Severity:   "info",
+				Module:     "s3-enum",
+				Finding:    "S3 bucket discovered",
+			})
+		}
+		if len(findings) > 0 {
+			if err := utils.WriteJSONToScanDir(scanID, "s3-buckets.json", findings); err != nil {
+				logger.GetLogger().Infof("[WARN] Failed to write S3 enum JSON: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func handleScan(opts Options, resultsDir string) error {
+	if opts.Bucket == "" {
+		return fmt.Errorf("bucket name is required for scan action")
+	}
+
+	// Accept a full S3 URL (bucket.s3.region.amazonaws.com, path-style, with or without
+	// scheme) as well as a plain bucket name — extract the bucket and any embedded region.
+	if b, r := ParseBucketInput(opts.Bucket); b != "" {
+		opts.Bucket = b
+		if opts.Region == "" {
+			opts.Region = r
+		}
+	}
+	// Auto-detect the region when still unknown. Required for buckets outside us-east-1
+	// (e.g. ap-south-1) whose virtual-hosted endpoints differ from the global host; also
+	// fulfils the launcher's "leave empty to auto-detect" hint.
+	if opts.Region == "" {
+		if r := detectBucketRegion(opts.Bucket); r != "" {
+			opts.Region = r
+			logger.GetLogger().Infof("[INFO] S3 scan: auto-detected region %s for bucket %s", r, opts.Bucket)
+		} else {
+			logger.GetLogger().Infof("[INFO] S3 scan: could not auto-detect region for %s (bucket may not exist); falling back to multi-region probing", opts.Bucket)
+		}
+	}
+
+	outputDir := filepath.Join(resultsDir, "s3", utils.SanitizeTargetSegment(opts.Bucket))
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	outputFile := filepath.Join(outputDir, "scan-results.txt")
+	logFile := filepath.Join(outputDir, "scan.log")
+
+	logger.GetLogger().Infof("[INFO] S3 scan: Starting scan for bucket: %s", opts.Bucket)
+	logger.GetLogger().Infof("[INFO] S3 scan: Output directory: %s", outputDir)
+	logger.GetLogger().Infof("[INFO] S3 scan: Results will be saved to: %s", outputFile)
+
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer outFile.Close()
+
+	logFileHandle, err := os.Create(logFile)
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %v", err)
+	}
+	defer logFileHandle.Close()
+
+	// Check if credentials are available
+	hasCredentials := os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != ""
+	logger.GetLogger().Infof("[INFO] S3 scan: AWS credentials available: %v", hasCredentials)
+	fmt.Fprintf(logFileHandle, "[INFO] S3 scan: AWS credentials available: %v\n", hasCredentials)
+	
+	scanSuccess := false
+	objectCount := 0
+	var scanMethod string
+	permList := false
+	permRead := false
+	permWrite := false
+	permDelete := false
+	
+	if hasCredentials {
+		// Try authenticated scan
+		logger.GetLogger().Infof("[INFO] S3 scan: Attempting authenticated scan using AWS SDK")
+		fmt.Fprintf(logFileHandle, "[INFO] Attempting authenticated scan using AWS SDK\n")
+		ctx := context.Background()
+		s3Client, err := newS3Client(ctx, opts.Region)
+		if err == nil {
+			logger.GetLogger().Infof("[INFO] S3 scan: Authenticated S3 client created successfully")
+			fmt.Fprintf(logFileHandle, "[INFO] Using authenticated S3 client for scanning\n")
+			paginator := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
+				Bucket: aws.String(opts.Bucket),
+			})
+
+			pageCount := 0
+			for paginator.HasMorePages() {
+				page, err := paginator.NextPage(ctx)
+				if err != nil {
+					logger.GetLogger().Infof("[WARN] S3 scan: Authenticated scan failed on page %d: %v", pageCount+1, err)
+					fmt.Fprintf(logFileHandle, "[WARN] Authenticated scan failed on page %d: %v, falling back to unauthenticated testing\n", pageCount+1, err)
+					break
+				}
+				pageCount++
+				logger.GetLogger().Infof("[INFO] S3 scan: Processing page %d (found %d objects so far)", pageCount, objectCount)
+				
+				for _, obj := range page.Contents {
+					t := aws.ToTime(obj.LastModified)
+					line := fmt.Sprintf("%s %12d %s\n", t.Format("2006-01-02 15:04:05"), obj.Size, aws.ToString(obj.Key))
+					if _, err := outFile.WriteString(line); err != nil {
+						return fmt.Errorf("failed to write output: %w", err)
+					}
+					objectCount++
+					if objectCount%100 == 0 {
+						logger.GetLogger().Infof("[INFO] S3 scan: Processed %d objects...", objectCount)
+					}
+				}
+				scanSuccess = true
+			}
+			
+			if scanSuccess {
+				scanMethod = "authenticated"
+				logger.GetLogger().Infof("[OK] S3 scan: Authenticated scan completed successfully - found %d object(s)", objectCount)
+				fmt.Fprintf(logFileHandle, "[OK] Authenticated scan completed - found %d object(s)\n", objectCount)
+			}
+		} else {
+			logger.GetLogger().Infof("[WARN] S3 scan: Failed to create authenticated client: %v", err)
+			fmt.Fprintf(logFileHandle, "[WARN] Failed to create authenticated client: %v, falling back to unauthenticated testing\n", err)
+		}
+	}
+
+	// Fallback to unauthenticated HTTP testing if no credentials or authenticated scan failed
+	if !hasCredentials || !scanSuccess {
+		if !hasCredentials {
+			logger.GetLogger().Infof("[INFO] S3 scan: No AWS credentials found, using unauthenticated HTTP testing")
+			fmt.Fprintf(logFileHandle, "[INFO] No AWS credentials found, using unauthenticated HTTP testing\n")
+		} else {
+			logger.GetLogger().Infof("[INFO] S3 scan: Authenticated scan failed, trying unauthenticated HTTP testing")
+			fmt.Fprintf(logFileHandle, "[INFO] Authenticated scan failed, trying unauthenticated HTTP testing\n")
+		}
+		fmt.Printf("[INFO] Testing bucket %s without authentication (public access check)...\n", opts.Bucket)
+		
+		regions := []string{"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-south-1", "eu-central-1"}
+		if opts.Region != "" {
+			regions = []string{opts.Region}
+		}
+		logger.GetLogger().Infof("[INFO] S3 scan: Testing %d region(s) for public access", len(regions))
+
+		var foundURL string
+		totalURLsTested := 0
+		for _, region := range regions {
+			urls := bucketListURLs(opts.Bucket, region)
+
+			logger.GetLogger().Infof("[INFO] S3 scan: Testing region %s (%d URL format(s))", region, len(urls))
+			for _, testURL := range urls {
+				totalURLsTested++
+				logger.GetLogger().Infof("[DEBUG] S3 scan: Testing URL: %s", testURL)
+				if objects := scanBucketPublicAccess(testURL, opts.Bucket, outFile, logFileHandle); len(objects) > 0 {
+					foundURL = testURL
+					objectCount = len(objects)
+					scanMethod = "unauthenticated (public)"
+					logger.GetLogger().Infof("[OK] S3 scan: Found publicly accessible bucket via %s - %d object(s)", testURL, len(objects))
+					fmt.Fprintf(logFileHandle, "[OK] Found publicly accessible bucket via %s - %d object(s)\n", testURL, len(objects))
+					break
+				}
+			}
+			if foundURL != "" {
+				break
+			}
+		}
+		
+		if foundURL == "" {
+			logger.GetLogger().Infof("[WARN] S3 scan: Bucket %s is not publicly accessible or does not exist (tested %d URL(s))", opts.Bucket, totalURLsTested)
+			fmt.Fprintf(logFileHandle, "[INFO] Bucket %s is not publicly accessible or does not exist (tested %d URL(s))\n", opts.Bucket, totalURLsTested)
+			fmt.Printf("[WARN] Could not access bucket %s without authentication. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for authenticated access.\n", opts.Bucket)
+			scanMethod = "none (not accessible)"
+		}
+	}
+
+	// Explicit unauthenticated permission probes for list/read/write/delete semantics.
+	permList, permRead, permWrite, permDelete = probeBucketPermissions(opts.Bucket, opts.Region, logFileHandle)
+	if permWrite && scanMethod == "none (not accessible)" {
+		scanMethod = "unauthenticated (writeable)"
+	}
+
+	// Check if results file has content (for logging)
+	fileInfo, err := os.Stat(outputFile)
+	_ = err
+	_ = fileInfo
+
+
+
+	fmt.Printf("[OK] S3 scan completed for bucket: %s\n", opts.Bucket)
+	fmt.Printf("[INFO] Scan method: %s\n", scanMethod)
+	fmt.Printf("[INFO] Objects found: %d\n", objectCount)
+	fmt.Printf("[INFO] Results saved to: %s\n", outputFile)
+	fmt.Printf("[INFO] Log saved to: %s\n", logFile)
+	logger.GetLogger().Infof("[OK] S3 scan completed for bucket: %s (method: %s, objects: %d, results: %s, log: %s)", opts.Bucket, scanMethod, objectCount, outputFile, logFile)
+
+	// Write structured JSON for the dashboard — the vulnerability is the publicly
+	// accessible bucket. One finding = one accessible bucket + object count as evidence.
+	if scanID := utils.GetCurrentScanID(); scanID != "" {
+		bucketURL := fmt.Sprintf("https://%s.s3.amazonaws.com", opts.Bucket)
+		type s3Finding struct {
+			Target      string `json:"target"`
+			Bucket      string `json:"bucket"`
+			Status      string `json:"status"`
+			Vulnerable  bool   `json:"vulnerable"`
+			Severity    string `json:"severity"`
+			Module      string `json:"module"`
+			Finding     string `json:"finding"`
+			ObjectCount int    `json:"object_count"`
+			ScanMethod  string `json:"scan_method"`
+			CanList     bool   `json:"can_list"`
+			CanRead     bool   `json:"can_read"`
+			CanWrite    bool   `json:"can_write"`
+			CanDelete   bool   `json:"can_delete"`
+		}
+		var findings []s3Finding
+		if objectCount > 0 || permList || permRead || permWrite || permDelete {
+			finding := "S3 bucket permission exposure"
+			if scanMethod != "" {
+				finding = fmt.Sprintf("S3 bucket permission exposure (%s)", scanMethod)
+			}
+			severity := "info"
+			status := "restricted"
+			if permWrite {
+				severity = "critical"
+				status = "public-write"
+			} else if permList || permRead {
+				severity = "high"
+				status = "public-read"
+			}
+			findings = append(findings, s3Finding{
+				Target:      bucketURL,
+				Bucket:      opts.Bucket,
+				Status:      status,
+				Vulnerable:  permList || permRead || permWrite || permDelete || objectCount > 0,
+				Severity:    severity,
+				Module:      "s3-scan",
+				Finding:     finding,
+				ObjectCount: objectCount,
+				ScanMethod:  scanMethod,
+				CanList:     permList,
+				CanRead:     permRead,
+				CanWrite:    permWrite,
+				CanDelete:   permDelete,
+			})
+			if err := utils.WriteJSONToScanDir(scanID, "s3-vulnerabilities.json", findings); err != nil {
+				logger.GetLogger().Infof("[WARN] Failed to write S3 JSON: %v", err)
+			}
+		} else {
+			_ = utils.WriteNoFindingsJSON(scanID, opts.Bucket, "s3-scan", "s3-vulnerabilities.json")
+		}
+	}
+
+	return nil
+}
+
+// ParseBucketInput accepts a plain bucket name OR any S3 URL form and returns the
+// bucket name and (when present) the AWS region. Recognised forms:
+//
+//	bucket-name
+//	bucket.s3.amazonaws.com                       (virtual-hosted, global/us-east-1)
+//	bucket.s3.ap-south-1.amazonaws.com            (virtual-hosted, modern dot)
+//	bucket.s3-ap-south-1.amazonaws.com            (virtual-hosted, legacy dash)
+//	bucket.s3.dualstack.ap-south-1.amazonaws.com  (virtual-hosted, dualstack)
+//	s3.amazonaws.com/bucket                       (path-style, global)
+//	s3.ap-south-1.amazonaws.com/bucket            (path-style, regional)
+//	https://…/…                                   (scheme, port and trailing path are stripped)
+func ParseBucketInput(input string) (bucket, region string) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", ""
+	}
+	if i := strings.Index(s, "://"); i != -1 {
+		s = s[i+3:]
+	}
+	host := s
+	path := ""
+	if i := strings.IndexByte(s, '/'); i != -1 {
+		host = s[:i]
+		path = strings.Trim(s[i+1:], "/")
+	}
+	if i := strings.IndexByte(host, ':'); i != -1 { // strip port
+		host = host[:i]
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+
+	const sfx = ".amazonaws.com"
+	if !strings.HasSuffix(host, sfx) {
+		// Plain bucket name (no AWS host) — return as-is.
+		return host, ""
+	}
+
+	core := strings.TrimSuffix(host, sfx) // e.g. "bucket.s3.ap-south-1", "bucket.s3", "s3.ap-south-1", "s3"
+
+	// Path-style: host is "s3" / "s3.<region>" / "s3-<region>", bucket is first path segment.
+	switch {
+	case core == "s3":
+		return firstSegment(path), ""
+	case strings.HasPrefix(core, "s3."):
+		return firstSegment(path), cleanRegion(strings.TrimPrefix(core, "s3."))
+	case strings.HasPrefix(core, "s3-"):
+		return firstSegment(path), cleanRegion(strings.TrimPrefix(core, "s3-"))
+	}
+
+	// Virtual-hosted: "<bucket>.s3" / "<bucket>.s3.<region>" / "<bucket>.s3-<region>".
+	// LastIndex so bucket names that themselves contain ".s3" still parse correctly.
+	if strings.HasSuffix(core, ".s3") {
+		return strings.TrimSuffix(core, ".s3"), ""
+	}
+	if i := strings.LastIndex(core, ".s3."); i != -1 {
+		return core[:i], cleanRegion(core[i+len(".s3."):])
+	}
+	if i := strings.LastIndex(core, ".s3-"); i != -1 {
+		return core[:i], cleanRegion(core[i+len(".s3-"):])
+	}
+	// Unknown amazonaws host shape — fall back to the first label.
+	return firstSegment(core), ""
+}
+
+// firstSegment returns everything before the first '/' (a bucket name, which may
+// itself contain dots, so we deliberately do not split on '.').
+func firstSegment(s string) string {
+	if i := strings.IndexByte(s, '/'); i != -1 {
+		return s[:i]
+	}
+	return s
+}
+
+// cleanRegion strips dualstack/website prefixes and trailing labels, leaving the bare
+// region (e.g. "dualstack.ap-south-1" -> "ap-south-1"). Returns "" for non-regions.
+func cleanRegion(r string) string {
+	r = strings.TrimPrefix(r, "dualstack.")
+	r = strings.TrimPrefix(r, "dualstack-")
+	r = strings.TrimPrefix(r, "website-")
+	r = strings.TrimPrefix(r, "website.")
+	if i := strings.IndexByte(r, '.'); i != -1 { // region is a single label
+		r = r[:i]
+	}
+	switch r {
+	case "", "external-1", "website", "dualstack", "accelerate":
+		// Non-region S3 host keywords (transfer-acceleration, website, FIPS dualstack).
+		return ""
+	}
+	return r
+}
+
+// detectBucketRegion returns the bucket's AWS region from the x-amz-bucket-region
+// response header, which S3 sets on any request to the bucket — even unauthenticated
+// 301/403/400 responses. Returns "" if it can't be determined.
+func detectBucketRegion(bucketName string) string {
+	if bucketName == "" {
+		return ""
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	for _, u := range []string{
+		"https://" + bucketName + ".s3.amazonaws.com",
+		"https://s3.amazonaws.com/" + bucketName,
+	} {
+		req, err := http.NewRequest("HEAD", u, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		region := resp.Header.Get("x-amz-bucket-region")
+		resp.Body.Close()
+		if region != "" {
+			return region
+		}
+	}
+	return ""
+}
+
+// bucketListURLs returns the candidate list-objects endpoints for a bucket, covering
+// the modern dot-style regional host (required for buckets outside us-east-1, e.g.
+// ap-south-1), the legacy dash-style host, and both virtual-hosted and path-style forms.
+func bucketListURLs(bucketName, region string) []string {
+	const q = "/?list-type=2"
+	urls := []string{
+		fmt.Sprintf("https://%s.s3.amazonaws.com%s", bucketName, q),
+		fmt.Sprintf("https://s3.amazonaws.com/%s%s", bucketName, q),
+	}
+	if region != "" && region != "us-east-1" {
+		urls = append(urls,
+			fmt.Sprintf("https://%s.s3.%s.amazonaws.com%s", bucketName, region, q), // modern dot (virtual-hosted)
+			fmt.Sprintf("https://s3.%s.amazonaws.com/%s%s", region, bucketName, q),  // modern dot (path-style)
+			fmt.Sprintf("https://%s.s3-%s.amazonaws.com%s", bucketName, region, q),  // legacy dash (virtual-hosted)
+			fmt.Sprintf("https://s3-%s.amazonaws.com/%s%s", region, bucketName, q),  // legacy dash (path-style)
+		)
+	}
+	return urls
+}
+
+func probeBucketPermissions(bucketName, region string, logFile io.Writer) (canList, canRead, canWrite, canDelete bool) {
+	// Resolve the region if the caller didn't supply one, so write/read/delete probes
+	// hit the bucket's real regional endpoint instead of only the global host (which
+	// 301-redirects for buckets outside us-east-1, making every probe read false).
+	if region == "" {
+		region = detectBucketRegion(bucketName)
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	urls := []string{
+		fmt.Sprintf("https://%s.s3.amazonaws.com", bucketName),
+	}
+	if region != "" && region != "us-east-1" {
+		// Modern dot-style host first — required for buckets outside us-east-1 (e.g.
+		// ap-south-1); the global host above returns a 301 redirect for those, so
+		// without this the permission probe always reads false. Legacy dash kept as fallback.
+		urls = append(urls,
+			fmt.Sprintf("https://%s.s3.%s.amazonaws.com", bucketName, region),
+			fmt.Sprintf("https://%s.s3-%s.amazonaws.com", bucketName, region),
+		)
+	}
+	testKey := fmt.Sprintf("roar-perm-test-%d.txt", time.Now().UnixNano())
+	testBody := []byte("roar permission test")
+	for _, base := range urls {
+		// list
+		if req, err := http.NewRequest("GET", base+"/?max-keys=1", nil); err == nil {
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == http.StatusOK {
+					canList = true
+				}
+				resp.Body.Close()
+			}
+		}
+		// write/put
+		if req, err := http.NewRequest("PUT", base+"/"+testKey, strings.NewReader(string(testBody))); err == nil {
+			req.Header.Set("Content-Type", "text/plain")
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+					canWrite = true
+				}
+				resp.Body.Close()
+			}
+		}
+		// read
+		if req, err := http.NewRequest("GET", base+"/"+testKey, nil); err == nil {
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == http.StatusOK {
+					canRead = true
+				}
+				resp.Body.Close()
+			}
+		}
+		// delete cleanup
+		if req, err := http.NewRequest("DELETE", base+"/"+testKey, nil); err == nil {
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusAccepted {
+					canDelete = true
+				}
+				resp.Body.Close()
+			}
+		}
+		if canList || canRead || canWrite || canDelete {
+			break
+		}
+	}
+	if logFile != nil {
+		fmt.Fprintf(logFile, "[INFO] Permission probe: list=%t read=%t write=%t delete=%t\n", canList, canRead, canWrite, canDelete)
+	}
+	return
+}
+
+// newS3Client creates an S3 client using AWS configuration.
+// It prioritizes environment variables and disables IMDS when not on EC2.
+func newS3Client(ctx context.Context, region string) (*s3.Client, error) {
+	// Check if credentials are provided via environment variables
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	
+	// Disable IMDS to avoid 404 errors when not running on EC2
+	// This prevents the SDK from trying to use EC2 instance metadata
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") == "" {
+		os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	}
+	
+	var cfg aws.Config
+	var err error
+	
+	if accessKey != "" && secretKey != "" {
+		// Use explicit credentials from environment variables
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithCredentialsProvider(aws.NewCredentialsCache(
+				aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+					return aws.Credentials{
+						AccessKeyID:     accessKey,
+						SecretAccessKey: secretKey,
+						SessionToken:    os.Getenv("AWS_SESSION_TOKEN"), // Optional
+					}, nil
+				}),
+			)),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load AWS config with explicit credentials: %w", err)
+		}
+	} else {
+		// Try default config (will check shared credentials file, etc.)
+		cfg, err = config.LoadDefaultConfig(ctx)
+		if err != nil {
+			// Check if error is related to IMDS/EC2
+			errStr := err.Error()
+			if strings.Contains(errStr, "IMDS") || 
+			   strings.Contains(errStr, "EC2") || 
+			   strings.Contains(errStr, "getToken") ||
+			   strings.Contains(errStr, "GetMetadata") ||
+			   strings.Contains(errStr, "no EC2 IMDS role found") {
+				return nil, fmt.Errorf("AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables in Dokploy. IMDS is disabled in Docker environments")
+			}
+			return nil, fmt.Errorf("failed to load AWS config: %w", err)
+		}
+	}
+	
+	// Set region
+	if region != "" {
+		cfg.Region = region
+	} else if cfg.Region == "" {
+		// Use default region from environment or fallback
+		if envRegion := os.Getenv("AWS_DEFAULT_REGION"); envRegion != "" {
+			cfg.Region = envRegion
+		} else {
+			cfg.Region = "us-east-1" // Default fallback
+		}
+	}
+	
+	return s3.NewFromConfig(cfg), nil
+}
+
+// testBucketPublicAccess tests if an S3 bucket is publicly accessible via HTTP
+func testBucketPublicAccess(url, bucketName string) bool {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	
+	// Check for successful responses (200, 403 means bucket exists but not public, 404 means doesn't exist)
+	// 200 or certain error responses indicate the bucket exists
+	if resp.StatusCode == http.StatusOK {
+		return true
+	}
+	
+	// Sometimes 403 with specific error codes means bucket exists
+	if resp.StatusCode == http.StatusForbidden {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		bodyStr := string(body)
+		// If we get an AWS error XML, the bucket exists (just not public)
+		if strings.Contains(bodyStr, "AccessDenied") || strings.Contains(bodyStr, "InvalidAccessKeyId") {
+			return false // Bucket exists but not public
+		}
+	}
+	
+	return false
+}
+
+// scanBucketPublicAccess attempts to list objects in a publicly accessible S3 bucket via HTTP
+func scanBucketPublicAccess(url, bucketName string, outFile *os.File, logFile *os.File) []string {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		logger.GetLogger().Infof("[DEBUG] S3 scan: Failed to create request for %s: %v", url, err)
+		return nil
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.GetLogger().Infof("[DEBUG] S3 scan: Request failed for %s: %v", url, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	
+	logger.GetLogger().Infof("[DEBUG] S3 scan: Response status for %s: %d", url, resp.StatusCode)
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	
+	// Parse XML response (S3 ListObjectsV2 XML format)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.GetLogger().Infof("[WARN] S3 scan: Failed to read response body for %s: %v", url, err)
+		return nil
+	}
+	
+	// Parse XML response (S3 ListBucketResult XML format)
+	// Look for <Contents> blocks with <Key>, <LastModified>, and <Size>
+	var objects []string
+	bodyStr := string(body)
+	
+	// Split by <Contents> to process each object
+	contents := strings.Split(bodyStr, "<Contents>")
+	logger.GetLogger().Infof("[DEBUG] S3 scan: Found %d object entry(ies) in XML response", len(contents)-1)
+	
+	for i := 1; i < len(contents); i++ {
+		content := contents[i]
+		
+		// Extract Key
+		keyStart := strings.Index(content, "<Key>")
+		keyEnd := strings.Index(content, "</Key>")
+		if keyStart == -1 || keyEnd == -1 || keyEnd <= keyStart {
+			continue
+		}
+		key := strings.TrimSpace(content[keyStart+5 : keyEnd])
+		
+		// Extract LastModified
+		modStart := strings.Index(content, "<LastModified>")
+		modEnd := strings.Index(content, "</LastModified>")
+		lastModified := ""
+		if modStart != -1 && modEnd != -1 && modEnd > modStart {
+			lastModified = strings.TrimSpace(content[modStart+14 : modEnd])
+		}
+		
+		// Extract Size
+		sizeStart := strings.Index(content, "<Size>")
+		sizeEnd := strings.Index(content, "</Size>")
+		size := "0"
+		if sizeStart != -1 && sizeEnd != -1 && sizeEnd > sizeStart {
+			size = strings.TrimSpace(content[sizeStart+6 : sizeEnd])
+		}
+		
+		objects = append(objects, key)
+		
+		// Format: timestamp size key (matching authenticated format)
+		line := fmt.Sprintf("%s %12s %s\n", lastModified, size, key)
+		if _, err := outFile.WriteString(line); err == nil {
+			fmt.Fprintf(logFile, "[OK] Found object: %s (size: %s, modified: %s)\n", key, size, lastModified)
+		}
+	}
+	
+	if len(objects) > 0 {
+		logger.GetLogger().Infof("[OK] S3 scan: Found %d publicly accessible object(s) in bucket %s via %s", len(objects), bucketName, url)
+		fmt.Fprintf(logFile, "[OK] Found %d publicly accessible objects in bucket %s via %s\n", len(objects), bucketName, url)
+	}
+	
+	return objects
+}
+
+// generateBucketNames generates potential S3 bucket names from a root domain
+func generateBucketNames(root string) []string {
+	// Remove common TLDs and clean the domain
+	root = strings.ToLower(root)
+	root = strings.TrimSuffix(root, ".com")
+	root = strings.TrimSuffix(root, ".net")
+	root = strings.TrimSuffix(root, ".org")
+	root = strings.TrimSuffix(root, ".io")
+	
+	// Common patterns
+	patterns := []string{
+		root,
+		fmt.Sprintf("%s-backup", root),
+		fmt.Sprintf("%s-backups", root),
+		fmt.Sprintf("%s-dev", root),
+		fmt.Sprintf("%s-development", root),
+		fmt.Sprintf("%s-prod", root),
+		fmt.Sprintf("%s-production", root),
+		fmt.Sprintf("%s-staging", root),
+		fmt.Sprintf("%s-test", root),
+		fmt.Sprintf("%s-testing", root),
+		fmt.Sprintf("%s-www", root),
+		fmt.Sprintf("%s-uploads", root),
+		fmt.Sprintf("%s-files", root),
+		fmt.Sprintf("%s-assets", root),
+		fmt.Sprintf("%s-media", root),
+		fmt.Sprintf("%s-static", root),
+		fmt.Sprintf("%s-public", root),
+		fmt.Sprintf("%s-private", root),
+		fmt.Sprintf("www.%s", root),
+		fmt.Sprintf("s3.%s", root),
+		fmt.Sprintf("storage.%s", root),
+		fmt.Sprintf("cdn.%s", root),
+	}
+
+	return patterns
+}

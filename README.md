@@ -1,0 +1,838 @@
+# ROAR — Automated Attack & Reconnaissance Platform
+
+
+
+**The ultimate bug bounty automation framework. Scan smarter, find more, ship faster.**
+
+[Go](https://golang.org/)
+[License](LICENSE)
+
+
+
+---
+
+ROAR is a powerful, end-to-end automated security reconnaissance and vulnerability hunting platform built in Go. It is purpose-built for **bug bounty hunters** and **penetration testers** who want to automate the full recon-to-report pipeline at scale — from subdomain enumeration and DNS takeover detection to nuclei scanning, JavaScript secrets extraction, GitHub exposure, mobile app analysis, and more.
+
+Results are automatically uploaded to **Cloudflare R2 storage** and linked directly in your output — no hunting through directories.
+
+**Public VPS / dashboard:** uses native Go JWT authentication with local PostgreSQL — no Supabase required. See [docs/DASHBOARD_AUTH.md](docs/DASHBOARD_AUTH.md).
+
+![Dashboard](image.png)
+---
+
+##  Feature Highlights
+
+
+| Category               | What ROAR Does                                                                                                                       |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+|  **Subdomains**      | Enumerate using 15+ sources: Subfinder, CertSpotter, SecurityTrails, Chaos, crt.sh, OTX, VirusTotal, and more                          |
+|  **Live Hosts**      | Detect alive hosts using httpx with follow-redirects and status detection                                                              |
+|  **DNS Takeovers**  | Detect CNAME, NS, Azure/AWS cloud, DNSReaper, dangling-IP, and **CF-1016 Cloudflare dangling record** vulnerabilities                  |
+|  **Nuclei Scanning** | Automated vulnerability scanning using Nuclei templates with rate limiting                                                             |
+|  **Zero-Days**       | Smart scan configured for detected tech stacks — finds active CVEs                                                                     |
+|  **S3 Buckets**      | Enumerate and scan AWS S3 buckets for exposure and misconfig                                                                           |
+|  **JavaScript**      | Extract secrets, API endpoints, auth tokens from JS files                                                                              |
+|  **GitHub Recon**    | Org-level and repo-level scanning for secrets, dependency confusion                                                                    |
+|  **APK Auditor**     | Browser-based Android analysis: DEX decompiler, manifest + cert parsing, tracker detection, MASVS mapping, and regex-driven findings with APX secret patterns. (Based on [apkauditor](https://github.com/thecybersandeep/apkauditor) by @thecybersandeep) |
+|  **IPA Auditor**     | Browser-based iOS IPA analysis: plist + Mach-O inspection, binary strings extraction, and findings tab powered by 200+ regex signatures plus MASVS-style rules. (Based on [ipaauditor](https://github.com/thecybersandeep/ipaauditor) by @thecybersandeep) |
+|  **ADB Auditor**    | Browser-based ADB security tool: USB device inspection, app enumeration, logcat tailing, file pull, activity launching. (Based on [adbauditor](https://github.com/thecybersandeep/adbauditor) by @thecybersandeep) |
+|  **Misconfigs**      | 100+ service misconfiguration checks                                                                                                   |
+|  **BB Scope**     | Fetch scope from HackerOne, Bugcrowd, Intigriti, YesWeHack (token), Immunefi — CLI & **dashboard Targets page**                       |
+|  **Monitoring**      | Subdomain + URL change monitoring daemon with webhook alerts (Discord-compatible) & DB history                                          |
+|  **AI Agent**        | Full AI hunt loop from the CLI (`roar agent` / `roar explain`) — defaults to **deepseek-v4-flash-free via OpenCode Zen** — free tier, no card required |
+|  **R2 Storage**      | Auto-upload every non-empty result file to Cloudflare R2 and print the public URL                                                      |
+|  **Smart Alerts**    | Rich webhook notifications for zero-findings scans — no more empty files or spam                                                       |
+|  **Web dashboard**  | **v4.1+** — Stats, scans, domains, monitors, R2 browser, Targets, APK/IPA/ADB Auditors, CF-1016 findings. Unified findings table with per-module columns, inline expandable detail panels, severity/chip/multi-field filters            |
+
+
+---
+
+##  Complete Command Reference
+
+### Workflows (Start Here)
+
+```
+roar domain run      -d <domain>           Full end-to-end workflow: subdomains → live hosts → ports →
+                       [--skip-ffuf]         tech → DNS → S3 → nuclei → JS → URLs → GF → backup → misconfig
+
+roar subdomain run   -s <subdomain>        Focused deep-dive on a single subdomain:
+                                             live check → ports → JS → vuln scan → nuclei
+
+roar lite run        -d <domain>           Lighter workflow: livehosts → reflection → JS → CNAME → DNS → misconfig
+                       [--skip-js]           Skip JavaScript scanning
+                       [--phase-timeout]     Set default phase timeout in seconds
+                       [--timeout-<phase>]   Specific overrides (e.g. --timeout-livehosts)
+
+roar recon run       -d <domain>           Unified recon: subdomains → live hosts → tech → CNAMEs → URLs/JS
+
+roar asr             -d <domain>           High-depth reconnaissance (ASR Modes)
+                       [-mode 1-5]           Recon mode (default: 5)
+                       [-t <threads>]        Number of threads
+```
+
+### Reconnaissance
+
+```
+roar subdomains get  -d <domain>            Enumerate subdomains (15+ passive sources + Subfinder)
+roar livehosts get   -d <domain>            Detect live hosts via httpx
+roar cnames get      -d <domain>            Collect all CNAME records
+roar urls collect    -d <domain>            Collect URLs (Wayback, gau, katana)
+                       [--subdomain]          Focus on specific subdomain URLs
+roar tech detect     -d <domain>            Detect web technologies (Wappalyzer, headers)
+roar ports scan      -d <domain>            Port scan with naabu
+```
+
+### Vulnerability Scanning
+
+```
+roar nuclei run      -d <domain>            Run Nuclei templates on all live hosts
+roar zerodays scan   -d <domain>            Smart CVE scanning based on detected tech
+                       -s <subdomain>         Scan a specific subdomain
+                       -f <domains_file>      Scan domains from a file
+                       [--cve <CVE-ID>]       Target a specific CVE
+                       [--dos-test]           Include DoS checks (use on your own targets only)
+                       [--silent]             Output only vulnerable hosts
+roar reflection scan -d <domain>            Scan for XSS/injection reflection points
+roar dalfox run      -d <domain>            Advanced XSS scanning with Dalfox
+roar sqlmap run      -d <domain>            SQL injection testing with SQLMap
+roar gf scan         -d <domain>            Grep for interesting patterns (SQLi, SSTI, LFI, etc.)
+roar jwt scan        --token <JWT_TOKEN>    Analyze JWT tokens for vulnerabilities
+                       [--skip-crack]
+                       [--test-attacks]
+                       [-w <wordlist>]
+```
+
+### DNS Takeover Detection
+
+```
+roar dns takeover    -d <domain>            Comprehensive DNS takeover scan (all methods)
+                       [-s <subdomain>]       Target a single subdomain directly (skips enumeration)
+roar dns cname       -d <domain>            CNAME takeover detection
+roar dns ns          -d <domain>            Nameserver takeover detection
+roar dns azure-aws   -d <domain>            Azure/AWS cloud service takeover
+roar dns dnsreaper   -d <domain>            DNSReaper-based detection
+roar dns dangling-ip -d <domain>            Dangling IP detection
+roar dns cf1016      -d <domain>            Cloudflare 1016 Dangling DNS — auto-enumerates subdomains,
+                                               then scans all for CF-1016 dangling records.
+                                               Saves structured JSON findings + writes live status to DB.
+                       -s <subdomain>         Scan a single subdomain directly
+                       -l <file>              Scan subdomains from a file
+roar dns all         -d <domain>            Run all DNS checks simultaneously
+```
+
+### JavaScript Scanning
+
+```
+roar js scan         -d <domain>            Scan all JS files for secrets and endpoints
+                       [-s <subdomain>]       Scope to a specific subdomain's JS
+```
+
+### Fuzzing (FFUF)
+
+```
+roar ffuf fuzz       -u <url>               Fuzz a URL (must contain FUZZ placeholder)
+                       -d <domain>            Fuzz all live hosts for a domain
+                       [-w <wordlist>]        Custom wordlist (default: Wordlists/quick_fuzz.txt)
+                       [-t <threads>]         Thread count
+                       [--bypass-403]         Attempt 403 bypass techniques
+                       [--recursion]          Recursive fuzzing
+                       [-e <extensions>]      File extensions to fuzz
+                       [--header <k:v>]       Custom headers
+```
+
+### Backup File Discovery
+
+```
+roar backup scan     -d <domain>            Hunt for exposed backup files on a domain
+                       -l <live_hosts_file>   Scan from a file of live hosts
+                       -f <domains_file>      Scan from a file of domains
+                       [-m <method>]          Methods: regular, withoutdots, withoutvowels,
+                                              reverse, mixed, withoutdv, shuffle, all
+                       [-ex .zip,.rar]        Specific extensions to hunt
+                       [-t <threads>]         Thread count
+```
+
+### S3 Bucket Hunting and Cloud Storage
+
+```
+roar s3 enum         -b <root_domain>       Generate and check S3 bucket name permutations
+roar s3 scan         -b <bucket_name>       Scan a specific bucket for access
+                       [-r <region>]          AWS region
+```
+
+### GitHub Reconnaissance
+
+```
+roar github scan     -r <owner/repo>        Scan a single repository for secrets
+roar github org      -o <org>               Full org-level scan (all repos)
+                       [-m <max-repos>]       Limit number of repos scanned
+roar github depconfusion -r <owner/repo>    Check for dependency confusion
+roar github experimental -r <owner/repo>    Deep experimental analysis
+roar github-wordlist scan -o <github_org>   Build wordlist from org's codebase
+```
+
+### Misconfiguration Detection
+
+```
+roar misconfig scan  <target>               Scan for common misconfigurations (100+ checks)
+                       [--service <id>]       Test a specific service
+                       [--delay <ms>]         Request delay
+                       [--permutations]       Include path permutations
+roar misconfig service <target> <service>   Test a single service
+roar misconfig list                          List all available service checks
+roar misconfig update                        Update built-in templates
+```
+
+### API Key Validation
+
+```
+roar keyhack list                           List all API key validation templates
+roar keyhack search  <query>               Search for a specific provider
+roar keyhack validate <provider> <api_key> Generate validation command for an API key
+roar keyhack add <name> <cmd> <desc>       Add a custom validation template
+```
+
+### Adobe Experience Manager (AEM)
+
+```
+roar aem scan        -d <domain>            Detect AEM instances and test vulnerabilities
+                       -l <live_hosts_file>   Scan from a file
+                       [--ssrf-host <host>]   SSRF callback host
+                       [--proxy <proxy>]      HTTP proxy
+```
+
+### Mobile Application Analysis (APK Auditor)
+
+The **APK Auditor** is a fully browser-based static analysis tool available at `/ui/apkauditor/`.
+
+**Drag & Drop Analysis (no server required):**
+- Drop any APK to instantly decompile DEX and run regex-based findings in the browser
+- Parsed binary AndroidManifest (exported components, permissions, SDK, backup flags, deep links)
+- Certificate analysis (debug keys, expired certs, weak algorithms)
+- 38+ tracker & SDK detection from DEX strings
+- Full in-browser file explorer (XML, JSON, images, .so files with hex view)
+- Regex presets and bulk pattern scans for secrets/tokens across code and resources
+- OWASP MASVS aligned reporting — one-click export
+
+> **Want to MITM an app's HTTPS traffic?** The auditor is static-analysis only — kept deliberately lightweight (all in-browser, no heavy server-side Java toolchain). To prepare an APK for interception, patch it locally with [apk-mitm](https://github.com/niklashigi/apk-mitm) (`npx apk-mitm app.apk`), install the patched build on your test device, then drop it back into the auditor if you want to analyze it.
+
+> **The APK Auditor never creates records in the main Scans dashboard** — it runs in its own context.
+
+### Mobile Application Analysis (IPA Auditor)
+
+The **IPA Auditor** is a browser-based iOS static analysis tool available at `/ui/ipaauditor/`.
+
+**What it covers:**
+- IPA parsing in-browser (no upload required for local analysis)
+- Info.plist extraction, URL schemes, entitlement/permission indicators
+- Mach-O binary string extraction with security pattern matching
+- Findings tab generated from:
+  - native iOS security rules (ATS, storage, crypto, webview/runtime checks)
+  - regex preset secret scans
+  - imported APX regex signatures from APK Auditor (200 patterns)
+- Combined findings coverage is now 200+ regex signatures plus core iOS rules
+- Explorer mode for source/resources with line-level finding navigation
+
+> **Important:** Auditor findings are signatures for triage and manual validation, not guaranteed exploitability.
+
+### Dependency Confusion
+
+```
+roar depconfusion scan <file>               Scan a local dependency file
+roar depconfusion github repo <owner/repo>  Scan a GitHub repo's dependencies
+roar depconfusion github org <org>          Scan all repos in a GitHub org
+roar depconfusion web <url> [url2...]       Scan web targets
+roar depconfusion web-file <file>           Scan targets listed in a file
+roar wpDepConf scan  -d <domain>            WordPress plugin dependency confusion
+                       -l <live_hosts_file>
+```
+
+### Bug Bounty Platform Scope Fetching
+
+**CLI:**
+
+```
+roar scope -p h1  -u <username> -t <token>        HackerOne
+roar scope -p bc  -t <token>                       Bugcrowd
+roar scope -p it  -t <token>                       Intigriti
+roar scope -p ywh -t <token>                       YesWeHack (JWT token — no email/password needed)
+roar scope -p immunefi                             Immunefi (no auth required)
+
+Options:
+  --bbp-only         Only programs offering monetary rewards
+  --pvt-only         Only private programs
+  --active-only      Only active programs
+  --extract-roots    Extract root domains (default: true)
+  -o <output>        Save output to a file
+```
+
+**Dashboard —  Targets page:**
+
+The web dashboard includes a dedicated **Targets** page (sidebar → Targets) that:
+- Shows color-coded cards for each platform with credential status
+- Lets you paste credentials or relies on env vars (`H1_TOKEN`, `BUGCROWD_TOKEN`, `YWH_TOKEN`, `INTIGRITI_TOKEN`)
+- Fetches all in-scope root domains with one click
+- Provides per-domain **+ Add** (saves to Domains DB) and **> Scan** (opens new scan)
+- **+ Add All** saves all domains in one bulk request
+- **Copy List** copies to clipboard (works on both HTTP and HTTPS)
+
+### Subdomain Monitoring
+
+The monitoring daemon uses a dedicated `last_run_at` DB column (fixes the old timer bug), persists every detected change to `monitor_changes` for history, and sends webhook alerts automatically. Set `MONITOR_WEBHOOK_URL` in your `.env` to any webhook endpoint (Discord webhook URLs work out of the box).
+
+```
+roar monitor subdomains -d <domain>         One-time check for subdomain changes
+                          [--check-new]       Alert on newly discovered subdomains
+
+roar monitor subdomains manage add    -d <domain> -i <interval_sec>
+roar monitor subdomains manage list
+roar monitor subdomains manage start  --all | --id <id> | -d <domain>
+roar monitor subdomains manage stop   --all | --id <id> | -d <domain>
+
+roar monitor updates manage add       -u <url> [--strategy hash|content|regex] [--pattern <regex>]
+roar monitor updates manage remove    -u <url>
+roar monitor updates manage start     [--id <id>] [--all]
+roar monitor updates manage list
+```
+
+### AI Agent Commands
+
+Autonomous bug hunting directly from the terminal.
+
+```
+roar agent "<request>" [--json]
+    Run the full AI agent loop (up to 20 iterations) from the CLI.
+    Example: roar agent "find XSS vulnerabilities on example.com"
+    Example: roar agent "full recon on example.com" --json
+
+roar explain <result-file> [--json]
+    Feed any scan result file to the AI for triage and follow-up suggestions.
+    Example: roar explain new-results/example.com/nuclei-output.txt
+    Example: roar explain new-results/example.com/js-secrets.txt --json
+
+roar status [--json]
+    Show runtime metrics and DB scan progress.
+    Useful for AI agents polling long-running scans:
+    Example: roar status --json
+    Returns: { "active_scans": [ { "target": "...", "current_phase": 4, "total_phases": 12 } ] }
+```
+
+---
+
+##  AI-Driven Security Framework — Free for Everyone
+
+ROAR's AI engine defaults to **[OpenCode Zen](https://opencode.ai/zen)** running `deepseek-v4-flash-free`. OpenCode Zen is OpenAI-compatible and offers a free tier with no card required. You can also bring your own OpenRouter or Gemini key — ROAR routes to whichever providers you configure.
+
+> **Free path in 60 seconds:** create a free OpenCode Zen account, copy your key into `OPENCODE_API_KEY`, and the agent works.
+
+### What the AI powers
+
+
+| Command                                 | What it does                                                                                                   |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `roar agent "<request>"`              | Autonomous agent loop — the AI plans, runs tools, validates findings, and reports confirmed bugs.             |
+| `roar agent "<request>" --json`       | Same agent loop with machine-readable JSON output for piping into other tools.                                 |
+| `roar explain <result-file>`          | Feed any result file to the AI for triage and follow-up suggestions.                                           |
+
+
+### Getting your free OpenCode Zen key
+
+1. Go to [opencode.ai/zen](https://opencode.ai/zen) and create a free account.
+2. Generate an API key from the dashboard.
+3. Drop it into `.env`:
+
+```env
+OPENCODE_API_KEY=oc-...
+# Optional model override — leave unset for the default deepseek-v4-flash-free.
+# Browse https://opencode.ai/zen/v1/models for the full list.
+OPENCODE_MODEL=
+```
+
+That's it. ROAR will use `deepseek-v4-flash-free` automatically for `roar agent` and `roar explain`.
+
+### Bringing your own OpenRouter key (optional)
+
+If you want to use OpenRouter (paid premium models or alternative free models):
+
+```env
+OPENROUTER_API_KEY=sk-or-v1-...
+# Optional model override — leave unset for z-ai/glm-4.5-air:free.
+OPENROUTER_MODEL=
+```
+
+### Provider priority
+
+When multiple keys are configured, ROAR tries them in this order — each provider falls back to the next on error:
+
+1. `OPENROUTER_API_KEY` → OpenRouter (`OPENROUTER_MODEL` or `z-ai/glm-4.5-air:free`)
+2. `OPENCODE_API_KEY` → OpenCode Zen (`OPENCODE_MODEL` or `deepseek-v4-flash-free`)
+3. `ZHIPU_API_KEY` → Z.ai direct endpoint
+4. `GEMINI_API_KEY` → Gemini Direct
+
+### Configuring from the dashboard
+
+The web dashboard (`/ui/settings`) exposes all four keys and the two model overrides. You can paste keys, change models, and reset to defaults without touching `.env`. Existing keys are masked in the input — leave the field blank to keep the saved value, type a new value to overwrite.
+
+### Database & Results
+
+```
+roar db domains list                         List all scanned domains
+roar db domains delete    -d <domain>        Remove a domain from the database
+roar db subdomains list   -d <domain>        List all stored subdomains for a domain
+roar db subdomains export -d <domain>        Export subdomains to a file
+                            [-o <output.txt>]
+roar db js list           -d <domain>        List stored JS endpoints for a domain
+roar db backup                               Create a database backup
+             [--upload-r2]                     Also upload the backup to Cloudflare R2
+```
+
+### Utilities
+
+```
+roar check-tools          Verify all required tools are installed
+roar setup               Install all ROAR dependencies
+roar cleanup             Delete all contents of the results directory
+roar help                Show help
+```
+
+### Server Mode
+
+```
+roar api                 Start the REST API server + web dashboard
+```
+
+---
+
+##  Installation
+
+### Option 1 — Docker (Primary & Recommended)
+
+The easiest way to run ROAR with all dependencies (Go, Nuclei, FFUF, APK Auditor tools, etc.) pre-installed. Requires [Docker](https://docs.docker.com/get-docker/) and [Docker Compose V2](https://docs.docker.com/compose/).
+
+1. **Clone & Configure:**
+   ```bash
+   git clone https://github.com/h0tak88r/ROAR.git && cd ROAR
+   cp .env.example .env
+   # Edit .env to set your API keys and configuration
+   ```
+
+2. **Database Choice:**
+   - **PostgreSQL (Standard):** Ensure `DB_TYPE=postgresql` and `DB_HOST` points to the `postgres` service:
+     ```env
+     DB_TYPE=postgresql
+     DB_HOST=postgresql://roar:roar@postgres:5432/bughunt?sslmode=disable
+     ```
+   - **SQLite (Quick Test):** `DB_TYPE=sqlite` and `DB_HOST=/app/bughunt.db`.
+
+3. **Launch:**
+   ```bash
+   # Build and start the API + Dashboard (add --profile localdb to also start PostgreSQL)
+   docker compose --profile localdb up -d
+   ```
+
+
+
+### Option 2 — Manual Build
+
+```bash
+git clone https://github.com/h0tak88r/ROAR.git
+cd ROAR
+
+# Install Go dependencies
+go mod tidy
+
+# Build the binary
+go build -tags netgo -o roar ./cmd/roar/
+
+# Verify it works
+./roar help
+```
+
+### Option 3 — Go Install
+
+```bash
+go install github.com/h0tak88r/ROAR/cmd/roar@latest
+```
+
+> Make sure `$GOPATH/bin` (typically `~/go/bin`) is in your `$PATH`:
+>
+> ```bash
+> echo 'export PATH="$PATH:$HOME/go/bin"' >> ~/.bashrc && source ~/.bashrc
+> ```
+
+
+---
+
+##  Configuration
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+### Core Config
+
+```env
+# Server mode (the API server also serves the web dashboard)
+ROAR_MODE=api
+
+# Results storage directory
+ROAR_RESULTS_DIR=./new-results
+
+# Database: postgresql or sqlite
+DB_TYPE=sqlite
+DB_HOST=./bughunt.db
+```
+
+### Monitor Webhook (Optional)
+
+The monitoring daemon posts change alerts to a webhook of your choice. Leave it unset to disable notifications.
+
+```env
+# Any webhook endpoint — Discord webhook URLs work out of the box (payload is {"content": "..."})
+MONITOR_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+### Cloudflare R2 Storage (Highly Recommended)
+
+ROAR automatically uploads every non-empty result file to R2 and prints a public URL in the scan output. AI assistants can see and share these links directly.
+
+```env
+USE_R2_STORAGE=true
+R2_BUCKET_NAME=roar
+R2_ACCOUNT_ID=your_cloudflare_account_id
+R2_ACCESS_KEY_ID=your_r2_access_key_id
+R2_SECRET_KEY=your_r2_secret_key
+R2_PUBLIC_URL=https://pub-xxxx.r2.dev   # Your bucket's public URL
+```
+
+Creating R2 Credentials:
+
+1. Cloudflare dashboard → R2 → Create Bucket
+2. Account Settings → API Tokens → Create R2 Token (read+write)
+3. Enable public access: Bucket Settings → Public Access → Allow
+
+### API Keys for Maximum Subdomain Coverage
+
+All keys are optional but recommended. ROAR uses whichever are provided:
+
+```env
+# Subdomain enumeration sources
+GITHUB_TOKEN=...
+SECURITYTRAILS_API_KEY=...
+SHODAN_API_KEY=...
+VIRUSTOTAL_API_KEY=...
+CENSYS_API_ID=...
+CENSYS_API_SECRET=...
+CERTSPOTTER_API_KEY=...
+CHAOS_API_KEY=...
+FOFA_EMAIL=...
+FOFA_KEY=...
+BINARYEDGE_API_KEY=...
+URLSCAN_API_KEY=...
+BEVIGIL_API_KEY=...
+WHOISXMLAPI_API_KEY=...
+ZOOMEYE_USERNAME=...
+ZOOMEYE_PASSWORD=...
+
+# Bug bounty platforms (Programs page + Targets page + `roar scope`)
+H1_USERNAME=...          # HackerOne
+H1_TOKEN=...             # HackerOne API token
+BUGCROWD_TOKEN=...       # Bugcrowd _crowdcontrol_session_key cookie
+INTIGRITI_TOKEN=...      # Intigriti researcher API token (INTIGRITI_API_KEY also accepted)
+YWH_TOKEN=...            # YesWeHack JWT
+
+# AI analysis — only ONE key is needed
+#  Recommended (free): OpenCode Zen (no credit card required)
+#    Sign up at https://opencode.ai/zen · uses deepseek-v4-flash-free automatically
+OPENCODE_API_KEY=oc-...   # Powers `roar agent` and `roar explain` — completely free
+# OPENCODE_MODEL=         # Optional override; see https://opencode.ai/zen/v1/models
+
+# Optional: OpenRouter for premium / alternative models
+OPENROUTER_API_KEY=...
+# OPENROUTER_MODEL=        # Optional override; defaults to z-ai/glm-4.5-air:free
+
+# Optional fallback: direct Gemini API
+GEMINI_API_KEY=...
+```
+
+### Scan Tuning
+
+```env
+# Nuclei
+NUCLEI_RATE_LIMIT=150       # Requests per second
+NUCLEI_CONCURRENCY=25       # Parallel templates
+
+# Fuzzing
+FFUF_THREADS=50
+FFUF_WORDLIST_PATH=./Wordlists/quick_fuzz.txt
+
+# Subfinder
+SUBFINDER_THREADS=10
+
+# Timeouts (seconds, 0 = no timeout)
+DOMAIN_RUN_TIMEOUT=18000    # 5 hours for full domain runs
+ROAR_TIMEOUT_MISCONFIG=1800
+ROAR_TIMEOUT_NUCLEI=0
+```
+
+---
+
+##  Quick Start (Docker)
+
+```bash
+# 1. Setup
+git clone https://github.com/h0tak88r/ROAR.git && cd ROAR
+cp .env.example .env  # Edit .env with your keys
+
+# 2. Start the stack (API + Dashboard + Postgres)
+docker compose --profile localdb up -d
+
+# 3. Run a scan via Docker
+docker compose run --rm roar-api domain run -d example.com
+
+# 4. Access the Dashboard
+# Open http://localhost:8000/ui/ in your browser
+```
+
+---
+
+##  Results Directory Structure
+
+All scan results are saved to `./new-results/` and automatically uploaded to R2 if configured:
+
+```
+new-results/
+├── <domain>/
+│   ├── subs/
+│   │   ├── subdomains.txt          All discovered subdomains
+│   │   └── live-subs.txt           Alive hosts
+│   ├── ports/
+│   │   └── port-scan.txt           Open ports per host
+│   ├── nuclei/
+│   │   └── nuclei-results.txt      Vulnerability findings
+│   ├── js/
+│   │   └── js-endpoints.txt        Extracted JS endpoints & secrets
+│   ├── urls/
+│   │   └── all-urls.txt            Collected URLs
+│   ├── misconfig/
+│   │   └── misconfig-scan-results.txt
+│   ├── backup/
+│   │   └── backup-files.txt        Discovered backup files
+│   └── wp-confusion/               WordPress confusion results
+├── s3/<domain>/                    S3 bucket scan results
+└── github/<owner>/                 GitHub scan results
+```
+
+When **R2 is enabled**, each file is uploaded immediately after writing and the URL is printed:
+
+```
+ R2 Result: new-results/example.com/subs/subdomains.txt
+   URL: https://pub-xxxx.r2.dev/new-results/example.com/subs/subdomains.txt
+```
+
+---
+
+##  CoPaw AI Integration
+
+ROAR is designed to work seamlessly with **CoPaw** AI assistant, enabling natural language control of your entire recon pipeline:
+
+> *"Scan all subdomains of example.com and check for DNS takeovers"*
+> *"Run a full domain scan on target.com and share me the results"*
+> *"Check if api.example.com has any JavaScript secrets"*
+
+The AI automatically calls the right ROAR commands, waits for results, and shares R2 links directly in your chat.
+
+See the [CoPaw ROAR Skill documentation](/blob/main/docs/copaw-skill.md) for full setup instructions.
+
+---
+
+##  Docker & Compose Deep Dive
+
+###  Architecture & Internal Structure (v4.1+)
+
+ROAR follows a strictly decoupled, package-based architecture designed for enterprise scaling and clean dependency management:
+
+- **`cmd/roar/`**: The main entry point. All binaries and commands start here.
+- **`internal/api/`**: The core backend source of truth. Manages all scan states (`ActiveScans`), database operations, REST endpoints, and orchestration. The web dashboard UI is served from here.
+- **`internal/cmd/`**: The Cobra command layer — every `roar` CLI subcommand is registered here.
+- **`internal/utils/`**: Centralized, shared logic (binary paths, helper functions, logging, env loading). This acts as the foundational layer to strictly prevent circular imports between packages.
+
+---
+
+The repository includes a multi-stage **Dockerfile** and a **docker-compose.yml** that manages the API server (which also serves the Dashboard UI) and an optional PostgreSQL container.
+
+### Environment Variables in Docker
+
+Docker services automatically load variables from the `.env` file in the root directory.
+
+| Variable | Recommended for Docker |
+| -------- | ---------------------- |
+| `ROAR_RESULTS_DIR` | `/app/new-results` (mounted as volume) |
+| `NUCLEI_TEMPLATES_PATH` | `/app/nuclei_templates` |
+| `DB_TYPE` | `postgresql` |
+| `DB_HOST` | `postgresql://roar:roar@postgres:5432/bughunt?sslmode=disable` |
+
+### PostgreSQL Integration
+
+ROAR's Docker stack includes a dedicated PostgreSQL container. This is the **recommended** way to run ROAR for persistence and performance.
+
+1. **Persistence:** Data is stored in the `postgres_data` Docker volume.
+2. **Access:** You can access the DB via `docker exec -it roar-postgres psql -U roar -d bughunt`.
+3. **Migration:** No manual migration needed; ROAR handles schema initialization on startup.
+
+### Service Profiles
+
+| Service / Profile | Services Started | Use Case |
+| ----------------- | ---------------- | -------- |
+| `roar-api` (no profile) | `roar-api` | API server + dashboard (uses an external/remote DB) |
+| `localdb` | `postgres` | Start the bundled PostgreSQL container |
+
+**Example:**
+```bash
+# Run the API + dashboard together with a local PostgreSQL container
+docker compose --profile localdb up -d
+```
+
+### Path Mapping & Volumes
+
+ROAR maps the following host directories into the container:
+- `./new-results` → `/app/new-results` (Scan outputs)
+- `./nuclei_templates` → `/app/nuclei_templates` (Nuclei rules)
+- `./Wordlists` → `/app/Wordlists` (Fuzzing lists)
+
+### Typical `.env` for Docker Full Stack
+
+```env
+ROAR_MODE=api
+ROAR_RESULTS_DIR=/app/new-results
+DB_TYPE=postgresql
+DB_HOST=postgresql://roar:roar@postgres:5432/bughunt?sslmode=disable
+USE_R2_STORAGE=true
+OPENCODE_API_KEY=oc-...   # or OPENROUTER_API_KEY / GEMINI_API_KEY
+```
+
+---
+
+##  Database
+
+ROAR supports two databases:
+
+### PostgreSQL (Production)
+
+```env
+DB_TYPE=postgresql
+DB_HOST=postgresql://username:password@host:5432/roar
+```
+
+#### Using Supabase (Free Cloud Postgres)
+
+1. Create a project at [supabase.com](https://supabase.com)
+2. Get connection URI from Settings → Database
+3. Use the pooled connection string:
+  ```env
+   DB_HOST=postgresql://postgres.xxx:password@aws-eu.pooler.supabase.com:6543/postgres?sslmode=require
+  ```
+
+### SQLite (Zero-config Local)
+
+```env
+DB_TYPE=sqlite
+DB_HOST=./bughunt.db
+```
+
+---
+
+##  Troubleshooting
+
+### No Terminal Logs?
+
+The API server logs to `api.log` by default. To see live output:
+
+```bash
+tail -f api.log
+# or set LOG_LEVEL=debug in your .env
+```
+
+### Missing Tools?
+
+Run the built-in check:
+
+```bash
+./roar check-tools
+./roar setup    # Auto-install missing dependencies
+```
+
+### BuildError: `pcap.h: No such file or directory`
+
+Install `libpcap-dev`:
+
+```bash
+sudo apt-get install -y libpcap-dev   # Debian/Ubuntu
+sudo yum install -y libpcap-devel     # RHEL/CentOS
+brew install libpcap                  # macOS
+```
+
+### R2 Uploads Not Working?
+
+1. Verify `USE_R2_STORAGE=true` in `.env`
+2. Check `R2_BUCKET_NAME`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_KEY` are all set
+3. Ensure your bucket has **public access enabled** in Cloudflare R2 settings
+4. Check the bucket allows the access key's permissions (object read/write)
+
+### Database Connection Refused
+
+For PostgreSQL, ensure:
+
+- The DB_HOST URL is correct and the server is running
+- Network allows connections (firewall rules, VPN)
+- For Supabase: use the **pooler** (port 6543) not the direct port (5432)
+
+---
+
+##  GitHub release (tag → CI)
+
+Versions are defined once in `[internal/version/version.go](internal/version/version.go)` (`Version`, no `v` prefix). To publish **v4.2.0**:
+
+1. Set `const Version = "4.2.0"` and commit.
+2. From the repo root:
+  ```bash
+   chmod +x scripts/tag-release.sh
+   ./scripts/tag-release.sh v4.2.0
+  ```
+   This pushes your current branch and the annotated tag. `**[.github/workflows/release.yml](.github/workflows/release.yml)**` then builds Linux binaries, attaches `tar.gz` / `zip`, generates release notes, and pushes `**ghcr.io/<owner>/roar**` for that tag.
+
+You need a Git remote with push access (HTTPS + token or SSH). No manual “Create release” step in the UI is required.
+
+---
+
+##  Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes: `git commit -m 'feat: add my feature'`
+4. Push and open a Pull Request
+
+---
+
+##  Legal Disclaimer
+
+ROAR is intended for **authorized security testing only**. Only use it on targets where you have explicit written permission, or on bug bounty programs where the target is in-scope. Unauthorized scanning of systems you do not own is illegal.
+
+The authors of ROAR assume no liability for misuse of this tool.
+
+---
+
+##  License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+
+
+Built with  for the bug bounty community · [GitHub](https://github.com/h0tak88r/ROAR)
+

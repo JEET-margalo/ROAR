@@ -1,0 +1,186 @@
+# ROAR — Docker Compose
+# Copy env.example to .env and set secrets before first run:  cp env.example .env
+#
+# Optional local Postgres (profiles: api + localdb):
+#   docker compose --profile api --profile localdb up -d postgres roar-api
+#   Set in .env: DB_TYPE=postgresql  DB_HOST=postgresql://roar:roar@postgres:5432/bughunt?sslmode=disable
+
+services:
+
+
+    # Example 2: API Server only
+    roar-api:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                RUN_SETUP_AT_BUILD: "true"
+        image: roar:latest
+        container_name: roar-api
+        user: root
+        restart: unless-stopped
+        env_file:
+            - .env
+        environment:
+            # Mode Configuration
+            - ROAR_MODE=api # API mode only
+
+            # API Configuration
+            - API_HOST=0.0.0.0
+            - API_PORT=8000
+
+            # Dashboard auth. API_HOST=0.0.0.0 is a PUBLIC bind, so the server
+            # refuses to start unless you EITHER set DASHBOARD_USER + DASHBOARD_PASSWORD
+            # (recommended — enables login) OR ROAR_API_AUTH_DISABLED=true (run open).
+            - DASHBOARD_USER=${DASHBOARD_USER:-}
+            - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-}
+            - ROAR_JWT_SECRET=${ROAR_JWT_SECRET:-}
+            - ROAR_API_AUTH_DISABLED=${ROAR_API_AUTH_DISABLED:-}
+            - ROAR_TRUSTED_PROXIES=${ROAR_TRUSTED_PROXIES:-}
+
+            # Core Configuration
+            - ROAR_SCRIPT_PATH=/usr/local/bin/roar
+            - ROAR_CONFIG_FILE=/app/roar.yaml
+            - ROAR_RESULTS_DIR=/app/new-results
+
+            # Tool Setup
+            - RUN_SETUP=${RUN_SETUP:-false}
+            - REGENERATE_CONFIG=${REGENERATE_CONFIG:-true}
+            - TRUFFLEHOG_NO_UPDATE=true
+            - TRUFFLEHOG_AUTOUPDATE=false
+
+            # API Keys
+            - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+            - SECURITYTRAILS_API_KEY=${SECURITYTRAILS_API_KEY:-}
+            - SHODAN_API_KEY=${SHODAN_API_KEY:-}
+            - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+            - WORDPRESS_API_KEY=${WORDPRESS_API_KEY:-}
+            - BEVIGIL_API_KEY=${BEVIGIL_API_KEY:-}
+            - BINARYEDGE_API_KEY=${BINARYEDGE_API_KEY:-}
+            - URLSCAN_API_KEY=${URLSCAN_API_KEY:-}
+            - CENSYS_API_ID=${CENSYS_API_ID:-}
+            - CENSYS_API_SECRET=${CENSYS_API_SECRET:-}
+            - CERTSPOTTER_API_KEY=${CERTSPOTTER_API_KEY:-}
+            - CHAOS_API_KEY=${CHAOS_API_KEY:-}
+            - FOFA_EMAIL=${FOFA_EMAIL:-}
+            - FOFA_KEY=${FOFA_KEY:-}
+            - FULLHUNT_API_KEY=${FULLHUNT_API_KEY:-}
+            - INTELX_API_KEY=${INTELX_API_KEY:-}
+            - PASSIVETOTAL_USERNAME=${PASSIVETOTAL_USERNAME:-}
+            - PASSIVETOTAL_API_KEY=${PASSIVETOTAL_API_KEY:-}
+            - QUAKE_USERNAME=${QUAKE_USERNAME:-}
+            - QUAKE_PASSWORD=${QUAKE_PASSWORD:-}
+            - THREATBOOK_API_KEY=${THREATBOOK_API_KEY:-}
+            - WHOISXMLAPI_API_KEY=${WHOISXMLAPI_API_KEY:-}
+            - ZOOMEYE_USERNAME=${ZOOMEYE_USERNAME:-}
+            - ZOOMEYE_PASSWORD=${ZOOMEYE_PASSWORD:-}
+            - ZOOMEYEAPI_API_KEY=${ZOOMEYEAPI_API_KEY:-}
+            # Bug bounty platform credentials (Programs + Targets pages, `roar scope`)
+            - H1_API_KEY=${H1_API_KEY:-}
+            - H1_USERNAME=${H1_USERNAME:-}
+            - H1_TOKEN=${H1_TOKEN:-}
+            - BUGCROWD_TOKEN=${BUGCROWD_TOKEN:-}
+            - INTIGRITI_TOKEN=${INTIGRITI_TOKEN:-}
+            - INTIGRITI_API_KEY=${INTIGRITI_API_KEY:-}
+            - YWH_TOKEN=${YWH_TOKEN:-}
+
+            # Database Configuration
+            # Database Type: "postgresql" or "sqlite"
+            # For PostgreSQL: Set DB_HOST to connection string or use individual variables
+            # For SQLite: Set DB_TYPE=sqlite and DB_HOST to file path (e.g., ./bughunt.db)
+            - SAVE_TO_DB=${SAVE_TO_DB:-true}
+            - DB_TYPE=${DB_TYPE:-postgresql}
+            - DB_HOST=${DB_HOST:-}
+            - DB_PORT=${DB_PORT:-5432}
+            - DB_USER=${DB_USER:-}
+            - DB_PASSWORD=${DB_PASSWORD:-}
+            - DB_NAME=${DB_NAME:-bughunt}
+
+            # Tool-specific Configuration
+            - NUCLEI_TEMPLATES_PATH=/app/nuclei_templates
+            - NUCLEI_RATE_LIMIT=${NUCLEI_RATE_LIMIT:-150}
+            - NUCLEI_CONCURRENCY=${NUCLEI_CONCURRENCY:-25}
+            - FFUF_WORDLIST_PATH=/app/Wordlists/quick_fuzz.txt
+            - FFUF_THREADS=${FFUF_THREADS:-50}
+            - SUBFINDER_THREADS=${SUBFINDER_THREADS:-10}
+
+            # AWS Configuration
+            - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+            - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+            - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+            - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+
+            # General Settings
+            - VERBOSE=${VERBOSE:-true}
+
+            # Dashboard (Supabase JWT) + R2 — pass through from .env (see docs/DASHBOARD_AUTH.md)
+            - SUPABASE_URL=${SUPABASE_URL:-}
+            - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET:-}
+            - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+            - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY:-}
+            - USE_R2_STORAGE=${USE_R2_STORAGE:-}
+            - R2_BUCKET_NAME=${R2_BUCKET_NAME:-}
+            - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
+            - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+            - R2_SECRET_KEY=${R2_SECRET_KEY:-}
+            - R2_PUBLIC_URL=${R2_PUBLIC_URL:-}
+            # AI / LLM providers — set whichever you use. See README "AI-Driven Security Framework".
+            - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+            - OPENCODE_MODEL=${OPENCODE_MODEL:-}
+            - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+            - OPENROUTER_MODEL=${OPENROUTER_MODEL:-}
+            - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+            - ZHIPU_API_KEY=${ZHIPU_API_KEY:-}
+
+        ports:
+            - "8000:8000" # Container listens on API_PORT (default 8000); change host side if needed: "9000:8000"
+        volumes:
+            - results-data:/app/new-results
+            - ./regexes:/app/regexes:ro
+            - /var/run/docker.sock:/var/run/docker.sock
+        healthcheck:
+            test:
+                ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${API_PORT:-8000}/health >/dev/null || exit 1"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 40s
+
+
+
+    # Optional PostgreSQL for self-hosted stacks (use with --profile localdb)
+    postgres:
+        image: postgres:16-alpine
+        container_name: roar-postgres
+        profiles:
+            - localdb
+        restart: unless-stopped
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER:-roar}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-roar}
+            POSTGRES_DB: ${POSTGRES_DB:-bughunt}
+        volumes:
+            - roar-pgdata:/var/lib/postgresql/data
+        ports:
+            - "${POSTGRES_PORT:-5432}:5432"
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U roar -d bughunt"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+            start_period: 10s
+
+volumes:
+    results-data:
+    roar-pgdata:
+# Usage Examples:
+#
+# 1. Run API Server (default):
+#    docker-compose up -d
+#    Access API docs at: http://localhost:8000/docs
+#
+# 2. Stop all services:
+#    docker-compose down
+#
+# 3. View logs:
+#    docker-compose logs -f [service-name]

@@ -1,0 +1,787 @@
+package nuclei
+
+import (
+	"context"
+	"fmt"
+	"html"
+	"github.com/h0tak88r/ROAR/internal/logger"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/h0tak88r/ROAR/internal/scanner/livehosts"
+	"github.com/h0tak88r/ROAR/internal/scanner/subdomains"
+	"github.com/h0tak88r/ROAR/internal/utils"
+	nucleiSDK "github.com/projectdiscovery/nuclei/v3/lib"
+	nucleiOutput "github.com/projectdiscovery/nuclei/v3/pkg/output"
+)
+
+// ScanMode represents the nuclei scan mode
+type ScanMode string
+
+const (
+	ModeFull            ScanMode = "full"
+	ModeCVEs            ScanMode = "cves"
+	ModePanels          ScanMode = "panels"
+	ModeDefaultLogins   ScanMode = "default-logins"
+	ModeVulnerabilities ScanMode = "vulnerabilities"
+)
+
+// Options holds nuclei scan options
+type Options struct {
+	Domain  string
+	URL     string
+	Mode    ScanMode
+	Threads int
+}
+
+// Result holds nuclei scan results
+type Result struct {
+	TargetName  string
+	Mode        ScanMode
+	ResultFiles []string
+}
+
+// RunNuclei runs nuclei scan based on options
+func RunNuclei(opts Options) (*Result, error) {
+	if opts.Domain == "" && opts.URL == "" {
+		return nil, fmt.Errorf("either domain (-d) or url (-u) must be provided")
+	}
+	if opts.Domain != "" && opts.URL != "" {
+		return nil, fmt.Errorf("cannot use both -d and -u together")
+	}
+	if opts.Mode == "" {
+		opts.Mode = ModeFull
+	}
+	if opts.Threads == 0 {
+		opts.Threads = 100
+	}
+
+	// Validate mode
+	validModes := map[ScanMode]bool{
+		ModeFull: true, ModeCVEs: true, ModePanels: true,
+		ModeDefaultLogins: true, ModeVulnerabilities: true,
+	}
+	if !validModes[opts.Mode] {
+		return nil, fmt.Errorf("invalid mode: %s. Must be full, cves, panels, default-logins, or vulnerabilities", opts.Mode)
+	}
+
+	root := utils.GetRootDir()
+	resultsDir := utils.GetResultsDir()
+	var targetFile, outputDir, targetName string
+
+	// Handle URL mode (single URL, no subdomain enum)
+	if opts.URL != "" {
+		logger.GetLogger().Infof("[INFO] Single URL mode: %s", opts.URL)
+		targetName = opts.URL
+
+		// Extract domain from URL for directory structure
+		extractedDomain := extractDomainFromURL(opts.URL)
+		domainDir := filepath.Join(resultsDir, extractedDomain)
+		outputDir = filepath.Join(domainDir, "vulnerabilities")
+		if err := utils.EnsureDir(outputDir); err != nil {
+			return nil, fmt.Errorf("failed to create output dir: %w", err)
+		}
+
+		// Create temporary URL file
+		targetFile = filepath.Join(domainDir, "temp-url.txt")
+		if err := utils.WriteFile(targetFile, []byte(opts.URL+"\n")); err != nil {
+			return nil, fmt.Errorf("failed to create temp URL file: %w", err)
+		}
+		defer os.Remove(targetFile)
+
+		logger.GetLogger().Infof("[INFO] Running Nuclei in %s mode on single URL", opts.Mode)
+		resultFiles, err := runNucleiScan(targetFile, outputDir, opts.Mode, opts.Threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		
+
+
+		// Index each JSONL result file into the scan directory so the dashboard can find them.
+		// We preserve the nuclei JSONL format rather than re-wrapping lines, so template-id,
+		// matched-at, info.severity etc. remain accessible for clean dashboard parsing.
+		if scanID := utils.GetCurrentScanID(); scanID != "" {
+			foundVulnerabilities := false
+			for _, rf := range resultFiles {
+				info, err := os.Stat(rf)
+				if err != nil || info.Size() == 0 {
+					continue
+				}
+				foundVulnerabilities = true
+				// Copy file into scan dir
+				scanFile := filepath.Join(utils.GetScanResultsDir(scanID), filepath.Base(rf))
+				if data, readErr := os.ReadFile(rf); readErr == nil {
+					if writeErr := os.WriteFile(scanFile, data, 0644); writeErr == nil {
+						if _, idxErr := utils.IndexExistingResultFile(scanID, scanFile); idxErr != nil {
+							logger.GetLogger().Infof("[WARN] Failed to index nuclei file %s: %v", filepath.Base(rf), idxErr)
+						}
+					}
+				}
+			}
+			if !foundVulnerabilities {
+				_ = utils.WriteNoFindingsJSON(scanID, targetName, "nuclei", "nuclei-results.json")
+			}
+		}
+
+		return &Result{TargetName: targetName, Mode: opts.Mode, ResultFiles: resultFiles}, nil
+	}
+
+	// Handle domain mode
+	logger.GetLogger().Infof("[INFO] Domain mode: %s", opts.Domain)
+	targetName = opts.Domain
+	domainDir := filepath.Join(resultsDir, utils.SanitizeTargetSegment(opts.Domain))
+	outputDir = filepath.Join(domainDir, "vulnerabilities")
+	if err := utils.EnsureDir(outputDir); err != nil {
+		return nil, fmt.Errorf("failed to create output dir: %w", err)
+	}
+
+	// Always perform subdomain enumeration and live-host detection for domain scans
+	logger.GetLogger().Infof("[INFO] Performing subdomain enumeration and live-host detection for %s", opts.Domain)
+	subsDir := filepath.Join(domainDir, "subs")
+	if err := utils.EnsureDir(subsDir); err != nil {
+		return nil, fmt.Errorf("failed to create subs dir: %w", err)
+	}
+
+	// Ensure subdomains via Go module
+	allSubsFile := filepath.Join(subsDir, "all-subs.txt")
+	if _, err := os.Stat(allSubsFile); err != nil {
+		logger.GetLogger().Infof("[INFO] Enumerating subdomains for %s", opts.Domain)
+		subs, err := subdomains.EnumerateSubdomains(opts.Domain, opts.Threads)
+		if err != nil {
+			logger.GetLogger().Infof("[WARN] Subdomain enumeration failed: %v", err)
+		} else {
+			if err := writeLines(allSubsFile, subs); err != nil {
+				logger.GetLogger().Infof("[WARN] Failed to write subdomains: %v", err)
+			} else {
+				logger.GetLogger().Infof("[OK] Found %d unique subdomains", len(subs))
+			}
+		}
+	}
+
+	// Get live hosts via DB-backed temp file (ephemeral — deleted after scan).
+	// WriteTempHostFile queries the DB first, falls back to the on-disk live-subs.txt.
+	tmpPath, cleanupTmp, tmpErr := utils.WriteTempHostFile(opts.Domain)
+	if tmpErr != nil {
+		// Last resort: run the livehosts phase to populate the DB
+		logger.GetLogger().Infof("[WARN] No live hosts available for %s (%v), running live host detection", opts.Domain, tmpErr)
+		_, lhErr := livehosts.FilterLiveHosts(opts.Domain, opts.Threads, true)
+		if lhErr != nil {
+			return nil, fmt.Errorf("no live hosts found for %s: %v", opts.Domain, lhErr)
+		}
+		tmpPath, cleanupTmp, tmpErr = utils.WriteTempHostFile(opts.Domain)
+		if tmpErr != nil {
+			return nil, fmt.Errorf("no live hosts found for %s after detection: %v", opts.Domain, tmpErr)
+		}
+	}
+	defer cleanupTmp()
+	targetFile = tmpPath
+
+	targetCount, _ := countLines(targetFile)
+	if targetCount == 0 {
+		logger.GetLogger().Infof("[WARN] Target file %s is empty, Nuclei will have nothing to scan!", targetFile)
+	}
+	logger.GetLogger().Infof("[INFO] Running Nuclei in %s mode on %d live targets (targets file: %s)", opts.Mode, targetCount, targetFile)
+
+	resultFiles, err := runNucleiScan(targetFile, outputDir, opts.Mode, opts.Threads, targetName, root)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.GetLogger().Infof("[OK] Nuclei scan completed successfully for %s (mode: %s)", targetName, opts.Mode)
+
+	// Index each JSONL result file into the scan dir (preserves nuclei JSON structure)
+	if scanID := utils.GetCurrentScanID(); scanID != "" {
+		foundVulnerabilities := false
+		for _, rf := range resultFiles {
+			info, err := os.Stat(rf)
+			if err != nil || info.Size() == 0 {
+				continue
+			}
+			foundVulnerabilities = true
+			scanFile := filepath.Join(utils.GetScanResultsDir(scanID), filepath.Base(rf))
+			if data, readErr := os.ReadFile(rf); readErr == nil {
+				if writeErr := os.WriteFile(scanFile, data, 0644); writeErr == nil {
+					if _, idxErr := utils.IndexExistingResultFile(scanID, scanFile); idxErr != nil {
+						logger.GetLogger().Infof("[WARN] Failed to index nuclei file %s: %v", filepath.Base(rf), idxErr)
+					}
+				}
+			}
+		}
+
+		if !foundVulnerabilities {
+			_ = utils.WriteNoFindingsJSON(scanID, targetName, "nuclei", "nuclei-results.json")
+		}
+	}
+
+
+
+	return &Result{TargetName: targetName, Mode: opts.Mode, ResultFiles: resultFiles}, nil
+}
+
+func runNucleiScan(targetFile, outputDir string, mode ScanMode, threads int, targetName, root string) ([]string, error) {
+	if err := utils.EnsureDir(outputDir); err != nil {
+		return nil, fmt.Errorf("failed to create output dir: %w", err)
+	}
+	logger.GetLogger().Infof("[INFO] Nuclei output directory: %s", outputDir)
+
+	var resultFiles []string
+
+	switch mode {
+	case ModeFull:
+		files, err := runFullScan(targetFile, outputDir, threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		resultFiles = append(resultFiles, files...)
+	case ModeCVEs:
+		files, err := runCVEsScan(targetFile, outputDir, threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		resultFiles = append(resultFiles, files...)
+	case ModePanels:
+		files, err := runPanelsScan(targetFile, outputDir, threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		resultFiles = append(resultFiles, files...)
+	case ModeDefaultLogins:
+		files, err := runDefaultLoginsScan(targetFile, outputDir, threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		resultFiles = append(resultFiles, files...)
+	case ModeVulnerabilities:
+		files, err := runVulnerabilitiesScan(targetFile, outputDir, threads, targetName, root)
+		if err != nil {
+			return nil, err
+		}
+		resultFiles = append(resultFiles, files...)
+	}
+
+	// Write a local debug summary (NOT indexed as a scan artifact — it produces noise in the dashboard)
+	summaryFile := filepath.Join(outputDir, "nuclei-summary.txt")
+	summaryContent := fmt.Sprintf("Nuclei Scan Summary\nTarget: %s\nMode: %s\n\n", targetName, mode)
+	if len(resultFiles) > 0 {
+		summaryContent += fmt.Sprintf("Found %d results files:\n", len(resultFiles))
+		for _, file := range resultFiles {
+			count, _ := countLines(file)
+			summaryContent += fmt.Sprintf("- %s (%d findings)\n", filepath.Base(file), count)
+		}
+	} else {
+		summaryContent += "No vulnerabilities found.\n"
+	}
+	// Write summary for local debugging only — do NOT append to resultFiles
+	_ = utils.WriteFile(summaryFile, []byte(summaryContent))
+
+	return resultFiles, nil
+}
+
+func runFullScan(targetFile, outputDir string, threads int, targetName, root string) ([]string, error) {
+	logger.GetLogger().Infof("[INFO] === Running FULL scan mode ===")
+	var resultFiles []string
+
+	// 1. Custom templates (nuclei_templates/vulns)
+	customDir := filepath.Join(root, "nuclei_templates", "vulns")
+	if dirExists(customDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with custom templates (nuclei_templates/vulns)...")
+		customOut := filepath.Join(outputDir, "nuclei-custom-others.json")
+		if err := runNucleiCommand(targetFile, customDir, threads, customOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei custom scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(customOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d findings with custom templates", count)
+			resultFiles = append(resultFiles, customOut)
+		}
+	}
+
+	// 2. Public HTTP templates
+	publicDir := filepath.Join(root, "nuclei-templates", "http")
+	if dirExists(publicDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with public HTTP templates (nuclei-templates/http)...")
+		publicOut := filepath.Join(outputDir, "nuclei-public-http.json")
+		if err := runNucleiCommand(targetFile, publicDir, threads, publicOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei public scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(publicOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d findings with public HTTP templates", count)
+			resultFiles = append(resultFiles, publicOut)
+		}
+	}
+
+	// 3. Technologies Discovery
+	techDir := filepath.Join(root, "nuclei-templates", "http", "technologies")
+	if dirExists(techDir) {
+		logger.GetLogger().Infof("[INFO] Scanning for technologies...")
+		techOut := filepath.Join(outputDir, "nuclei-technologies.json")
+		if err := runNucleiCommand(targetFile, techDir, threads, techOut); err == nil {
+			if count, _ := countLines(techOut); count > 0 {
+				logger.GetLogger().Infof("[OK] Found %d tech findings", count)
+				resultFiles = append(resultFiles, techOut)
+			}
+		}
+	}
+
+	// 4. Network and SSL
+	for _, cat := range []string{"network", "ssl", "dns"} {
+		catDir := filepath.Join(root, "nuclei-templates", cat)
+		if dirExists(catDir) {
+			logger.GetLogger().Infof("[INFO] Scanning with public %s templates...", cat)
+			catOut := filepath.Join(outputDir, "nuclei-public-"+cat+".json")
+			if err := runNucleiCommand(targetFile, catDir, threads, catOut); err == nil {
+				if count, _ := countLines(catOut); count > 0 {
+					logger.GetLogger().Infof("[OK] Found %d findings with %s templates", count, cat)
+					resultFiles = append(resultFiles, catOut)
+				}
+			}
+		}
+	}
+
+	// 5. Also run CVEs and Panels scans in full mode
+	if cveFiles, err := runCVEsScan(targetFile, outputDir, threads, targetName, root); err == nil {
+		resultFiles = append(resultFiles, cveFiles...)
+	}
+	if panelFiles, err := runPanelsScan(targetFile, outputDir, threads, targetName, root); err == nil {
+		resultFiles = append(resultFiles, panelFiles...)
+	}
+
+	return resultFiles, nil
+}
+
+func runCVEsScan(targetFile, outputDir string, threads int, targetName, root string) ([]string, error) {
+	logger.GetLogger().Infof("[INFO] === Running CVEs scan mode ===")
+	var resultFiles []string
+
+	// Custom CVE templates
+	customDir := filepath.Join(root, "nuclei_templates", "cves")
+	if dirExists(customDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with custom CVE templates...")
+		customOut := filepath.Join(outputDir, "nuclei-custom-cves.json")
+		if err := runNucleiCommand(targetFile, customDir, threads, customOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei custom CVE scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(customOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d CVE findings with custom templates", count)
+			resultFiles = append(resultFiles, customOut)
+		}
+	}
+
+	// Public CVE templates
+	publicDir := filepath.Join(root, "nuclei-templates", "http", "cves")
+	if dirExists(publicDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with public CVE templates...")
+		publicOut := filepath.Join(outputDir, "nuclei-public-cves.json")
+		if err := runNucleiCommand(targetFile, publicDir, threads, publicOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei public CVE scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(publicOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d CVE findings with public templates", count)
+			resultFiles = append(resultFiles, publicOut)
+		}
+	}
+
+	return resultFiles, nil
+}
+
+func runPanelsScan(targetFile, outputDir string, threads int, targetName, root string) ([]string, error) {
+	logger.GetLogger().Infof("[INFO] === Running Panels Discovery scan mode ===")
+	var resultFiles []string
+
+	// Custom panels templates
+	customDir := filepath.Join(root, "nuclei_templates", "panels")
+	if dirExists(customDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with custom panel templates...")
+		customOut := filepath.Join(outputDir, "nuclei-custom-panels.json")
+		if err := runNucleiCommand(targetFile, customDir, threads, customOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei custom panels scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(customOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d panels with custom templates", count)
+			resultFiles = append(resultFiles, customOut)
+		}
+	}
+
+	// Public exposed-panels templates
+	publicDir := filepath.Join(root, "nuclei-templates", "http", "exposed-panels")
+	if dirExists(publicDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with public exposed panels templates...")
+		publicOut := filepath.Join(outputDir, "nuclei-public-panels.json")
+		if err := runNucleiCommand(targetFile, publicDir, threads, publicOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei public panels scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(publicOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d exposed panels with public templates", count)
+			resultFiles = append(resultFiles, publicOut)
+		}
+	}
+
+	return resultFiles, nil
+}
+
+func runDefaultLoginsScan(targetFile, outputDir string, threads int, targetName, root string) ([]string, error) {
+	logger.GetLogger().Infof("[INFO] === Running Default Logins scan ===")
+	var resultFiles []string
+
+		// Custom default logins templates
+	customDir := filepath.Join(root, "nuclei_templates", "default-logins")
+	if dirExists(customDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with custom default logins templates...")
+		customOut := filepath.Join(outputDir, "nuclei-custom-default-logins.json")
+		if err := runNucleiCommand(targetFile, customDir, threads, customOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei custom default logins scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(customOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d default login findings with custom templates", count)
+			resultFiles = append(resultFiles, customOut)
+		}
+	}
+
+	// Public default logins templates
+	publicDir := filepath.Join(root, "nuclei-templates", "http", "default-logins")
+	if dirExists(publicDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with public default logins templates...")
+		publicOut := filepath.Join(outputDir, "nuclei-public-default-logins.json")
+		if err := runNucleiCommand(targetFile, publicDir, threads, publicOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei public default logins scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(publicOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d default login findings with public templates", count)
+			resultFiles = append(resultFiles, publicOut)
+		}
+	}
+
+	return resultFiles, nil
+}
+
+func runVulnerabilitiesScan(targetFile, outputDir string, threads int, targetName, root string) ([]string, error) {
+	logger.GetLogger().Infof("[INFO] === Running Generic Vulnerabilities scan mode ===")
+	var resultFiles []string
+
+	// Custom vulnerability templates
+	customDir := filepath.Join(root, "nuclei_templates", "vulns")
+	if dirExists(customDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with custom vulnerability templates...")
+		customOut := filepath.Join(outputDir, "nuclei-custom-vulnerabilities.json")
+		if err := runNucleiCommand(targetFile, customDir, threads, customOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei custom vulnerabilities scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(customOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d vulnerability findings with custom templates", count)
+			resultFiles = append(resultFiles, customOut)
+		}
+	}
+
+	// Public vulnerability templates
+	publicDir := filepath.Join(root, "nuclei-templates", "http", "vulnerabilities")
+	if dirExists(publicDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with public vulnerability templates...")
+		publicOut := filepath.Join(outputDir, "nuclei-public-vulnerabilities.json")
+		if err := runNucleiCommand(targetFile, publicDir, threads, publicOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei public vulnerabilities scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(publicOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d vulnerability findings with public templates", count)
+			resultFiles = append(resultFiles, publicOut)
+		}
+	}
+
+	// DAST vulnerability templates
+	dastDir := filepath.Join(root, "nuclei-templates", "dast", "vulnerabilities")
+	if dirExists(dastDir) {
+		logger.GetLogger().Infof("[INFO] Scanning with DAST vulnerability templates...")
+		dastOut := filepath.Join(outputDir, "nuclei-dast-vulnerabilities.json")
+		if err := runNucleiCommand(targetFile, dastDir, threads, dastOut); err != nil {
+			logger.GetLogger().Infof("[WARN] Nuclei DAST vulnerabilities scan returned error: %v (checking output file anyway)", err)
+		}
+		if count, _ := countLines(dastOut); count > 0 {
+			logger.GetLogger().Infof("[OK] Found %d vulnerability findings with DAST templates", count)
+			resultFiles = append(resultFiles, dastOut)
+		}
+	}
+
+	return resultFiles, nil
+}
+
+// runNucleiCommand runs nuclei with JSONL output (-json flag).
+// Each line of the output file is a self-contained JSON object with fields:
+//   template-id, matched-at, info.severity, info.name, host, etc.
+// This lets the dashboard parse clean vulnerability names instead of raw text.
+func runNucleiCommand(targetFile, templateDir string, threads int, outputFile string) error {
+	targets, err := readTargetLines(targetFile)
+	if err != nil {
+		return fmt.Errorf("failed to read nuclei targets: %w", err)
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no nuclei targets found in %s", targetFile)
+	}
+	if err := utils.EnsureDir(filepath.Dir(outputFile)); err != nil {
+		return fmt.Errorf("failed to ensure nuclei output dir: %w", err)
+	}
+	fh, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create nuclei output file: %w", err)
+	}
+	defer fh.Close()
+	jsonWriter, err := nucleiOutput.NewWriter(
+		nucleiOutput.WithWriter(fh),
+		nucleiOutput.WithJson(true, false),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize nuclei JSON writer: %w", err)
+	}
+	defer jsonWriter.Close()
+
+	logger.GetLogger().Infof("[EXEC] Running nuclei SDK with templates: %s (targets=%d, threads=%d)", templateDir, len(targets), threads)
+	if err := ensureNucleiIgnoreFile(); err != nil {
+		logger.GetLogger().Infof("[WARN] Failed to prepare nuclei ignore file: %v", err)
+	}
+	engine, err := nucleiSDK.NewNucleiEngineCtx(
+		context.Background(),
+		nucleiSDK.DisableUpdateCheck(),
+		nucleiSDK.WithVerbosity(nucleiSDK.VerbosityOptions{Silent: true}),
+		nucleiSDK.WithTemplatesOrWorkflows(nucleiSDK.TemplateSources{
+			Templates: []string{templateDir},
+		}),
+		nucleiSDK.WithConcurrency(nucleiSDK.Concurrency{
+			TemplateConcurrency:           max(1, min(threads, 25)),
+			HostConcurrency:               max(1, threads),
+			HeadlessHostConcurrency:       max(1, min(threads, 10)),
+			HeadlessTemplateConcurrency:   max(1, min(threads, 10)),
+			JavascriptTemplateConcurrency: max(1, min(threads, 10)),
+			TemplatePayloadConcurrency:    25,
+			ProbeConcurrency:              max(1, min(threads, 50)),
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize nuclei SDK: %w", err)
+	}
+	defer engine.Close()
+
+	engine.LoadTargets(targets, false)
+	writeErr := error(nil)
+	err = engine.ExecuteWithCallback(func(event *nucleiOutput.ResultEvent) {
+		if event == nil || writeErr != nil {
+			return
+		}
+		if wErr := jsonWriter.Write(event); wErr != nil {
+			writeErr = wErr
+		}
+	})
+	if writeErr != nil {
+		return fmt.Errorf("failed writing nuclei SDK output: %w", writeErr)
+	}
+	if err != nil {
+		logger.GetLogger().Infof("[WARN] Nuclei SDK execution returned error: %v", err)
+	}
+	return err
+}
+
+// RunGlobalTemplate executes a specific nuclei template against a list of targets using the SDK.
+// scanRequestHeaders returns headers sent with every nuclei request.
+//
+// Nuclei's default User-Agent names itself as a scanner, and commodity WAFs
+// reject it outright — which produces silent FALSE NEGATIVES, not errors. Proven
+// on a host with a confirmed CVE-2025-62138 exposure: identical requests, only
+// the UA differing, returned 404/406 with the default agent and 200 with a
+// browser one. The vulnerable endpoint answered {"INVALIDEMAIL":true} only in
+// the latter, so a WAF-fronted host looked clean when it was not.
+//
+// Override with ROAR_SCAN_USER_AGENT.
+func scanRequestHeaders() []string {
+	ua := os.Getenv("ROAR_SCAN_USER_AGENT")
+	if ua == "" {
+		ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	}
+	return []string{"User-Agent: " + ua}
+}
+
+func RunGlobalTemplate(targetFile, templatePath, outPath string, threads int, onResult func(event *nucleiOutput.ResultEvent)) error {
+	targets, err := readTargetLines(targetFile)
+	if err != nil {
+		return fmt.Errorf("failed to read targets: %w", err)
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no targets found in %s", targetFile)
+	}
+	if err := utils.EnsureDir(filepath.Dir(outPath)); err != nil {
+		return fmt.Errorf("failed to ensure output dir: %w", err)
+	}
+	fh, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer fh.Close()
+
+	jsonWriter, err := nucleiOutput.NewWriter(
+		nucleiOutput.WithWriter(fh),
+		nucleiOutput.WithJson(true, false),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize JSON writer: %w", err)
+	}
+	defer jsonWriter.Close()
+
+	engine, err := nucleiSDK.NewNucleiEngineCtx(
+		context.Background(),
+		nucleiSDK.DisableUpdateCheck(),
+		nucleiSDK.WithVerbosity(nucleiSDK.VerbosityOptions{Silent: true}),
+		nucleiSDK.WithHeaders(scanRequestHeaders()),
+		nucleiSDK.WithTemplatesOrWorkflows(nucleiSDK.TemplateSources{
+			Templates: []string{templatePath},
+		}),
+		nucleiSDK.WithConcurrency(nucleiSDK.Concurrency{
+			TemplateConcurrency:           max(1, min(threads, 25)),
+			HostConcurrency:               max(1, threads),
+			HeadlessHostConcurrency:       max(1, min(threads, 10)),
+			HeadlessTemplateConcurrency:   max(1, min(threads, 10)),
+			JavascriptTemplateConcurrency: max(1, min(threads, 10)),
+			TemplatePayloadConcurrency:    25,
+			ProbeConcurrency:              max(1, min(threads, 50)),
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize SDK: %w", err)
+	}
+	defer engine.Close()
+
+	engine.LoadTargets(targets, false)
+	writeErr := error(nil)
+	err = engine.ExecuteWithCallback(func(event *nucleiOutput.ResultEvent) {
+		if event == nil || writeErr != nil {
+			return
+		}
+		if wErr := jsonWriter.Write(event); wErr != nil {
+			writeErr = wErr
+		}
+		if onResult != nil {
+			onResult(event)
+		}
+	})
+	if writeErr != nil {
+		return writeErr
+	}
+	return err
+}
+
+func extractDomainFromURL(url string) string {
+	// Simple extraction: remove http:// or https://, then take first part before /
+	url = strings.TrimPrefix(url, "http://")
+	url = strings.TrimPrefix(url, "https://")
+	if idx := strings.Index(url, "/"); idx > 0 {
+		url = url[:idx]
+	}
+	return url
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func countLines(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	count := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func writeLines(path string, lines []string) error {
+	return utils.WriteLines(path, lines)
+}
+
+func readTargetLines(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	targets := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	skipped := 0
+	for _, line := range lines {
+		t, ok := sanitizeNucleiTarget(line)
+		if !ok {
+			skipped++
+			continue
+		}
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		targets = append(targets, t)
+	}
+	if skipped > 0 {
+		logger.GetLogger().Infof("[WARN] Skipped %d malformed nuclei targets from %s", skipped, path)
+	}
+	return targets, nil
+}
+
+var hostOnlyPattern = regexp.MustCompile(`^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$`)
+
+func sanitizeNucleiTarget(raw string) (string, bool) {
+	t := strings.TrimSpace(html.UnescapeString(raw))
+	if t == "" {
+		return "", false
+	}
+	if strings.ContainsAny(t, "<>\"'`") || strings.Contains(t, " ") {
+		return "", false
+	}
+	// Reject common template placeholders / malformed URL escapes from noisy sources.
+	if strings.Contains(t, "%s") || strings.HasSuffix(t, "%") {
+		return "", false
+	}
+	if strings.Contains(t, "://") {
+		u, err := url.ParseRequestURI(t)
+		if err != nil || u.Host == "" {
+			return "", false
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return "", false
+		}
+		return t, true
+	}
+	if hostOnlyPattern.MatchString(t) {
+		return t, true
+	}
+	return "", false
+}
+
+func ensureNucleiIgnoreFile() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	ignorePath := filepath.Join(home, ".config", "nuclei", ".nuclei-ignore")
+	if err := os.MkdirAll(filepath.Dir(ignorePath), 0755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(ignorePath); err == nil {
+		return nil
+	}
+	f, err := os.Create(ignorePath)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

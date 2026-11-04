@@ -1,0 +1,1832 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/h0tak88r/ROAR/internal/db"
+	"github.com/h0tak88r/ROAR/internal/r2storage"
+	"github.com/h0tak88r/ROAR/internal/utils"
+	"github.com/h0tak88r/ROAR/internal/version"
+)
+
+const (
+	// defaultMaxScanResults caps in-memory result entries.
+	defaultMaxScanResults = 1000
+	// defaultMaxScanResultsBytes caps aggregate cached output bytes across scanResults.
+	defaultMaxScanResultsBytes int64 = 128 * 1024 * 1024
+	// defaultMaxConcurrentScans limits simultaneous child-process scans.
+	defaultMaxConcurrentScans = 15
+	// defaultScanOutputCaptureBytes limits per-scan in-memory log capture.
+	defaultScanOutputCaptureBytes = 2 * 1024 * 1024
+)
+
+var (
+	maxScanResults               = defaultMaxScanResults
+	maxScanResultsBytes    int64 = defaultMaxScanResultsBytes
+	maxConcurrentScans           = defaultMaxConcurrentScans
+	scanOutputCaptureBytes       = defaultScanOutputCaptureBytes
+	minRuntimeFreeMemBytes int64 = 0
+
+	scanResults           = make(map[string]*ScanResult)
+	scanResultsTotalBytes int64
+	apiScansMutex         sync.RWMutex
+
+	// scanSemaphore limits concurrent child-process scans (#2 rate limiting).
+	scanSemaphore      = make(chan struct{}, maxConcurrentScans)
+	resourceLimitsOnce sync.Once
+)
+
+// safeEnvPrefixes lists environment variable prefixes that are safe to
+// pass through to child processes. Everything else is stripped to
+// prevent leaking secrets (API keys, tokens, passwords) via the
+// environment.
+var safeEnvPrefixes = []string{
+	"HOME=", "USER=", "LOGNAME=", "PATH=", "PWD=", "SHELL=", "TERM=", "LANG=", "LC_", "TZ=",
+	"GOPATH=", "GOROOT=", "GOPROXY=", "GOMODCACHE=", "GOFLAGS=",
+	"ROAR_", "DOCKER_", "KUBERNETES_",
+	"SSL_CERT_FILE=", "SSL_CERT_DIR=",
+	"HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY=", "http_proxy=", "https_proxy=", "no_proxy=",
+}
+
+// sanitizeEnv filters os.Environ() to only keep safe variables and appends
+// the given key=value pair(s). This prevents secrets from leaking into child
+// processes.
+func sanitizeEnv(parentEnv []string, extra ...string) []string {
+	out := make([]string, 0, len(safeEnvPrefixes)+len(extra))
+	for _, ev := range parentEnv {
+		for _, prefix := range safeEnvPrefixes {
+			if len(ev) >= len(prefix) && ev[:len(prefix)] == prefix {
+				out = append(out, ev)
+				break
+			}
+		}
+	}
+	for _, e := range extra {
+		out = append(out, e)
+	}
+	return out
+}
+
+func scanResultSizeBytes(r *ScanResult) int64 {
+	if r == nil {
+		return 0
+	}
+	return int64(len(r.Output) + len(r.Error) + len(r.ScanID) + len(r.ScanType) + len(r.Status))
+}
+
+func storeScanResultLocked(scanID string, result *ScanResult) {
+	if old, ok := scanResults[scanID]; ok {
+		scanResultsTotalBytes -= scanResultSizeBytes(old)
+	}
+	scanResults[scanID] = result
+	scanResultsTotalBytes += scanResultSizeBytes(result)
+	for len(scanResults) > maxScanResults || scanResultsTotalBytes > maxScanResultsBytes {
+		var oldest string
+		var oldestTime time.Time
+		for id, r := range scanResults {
+			if oldest == "" || r.StartedAt.Before(oldestTime) {
+				oldest = id
+				oldestTime = r.StartedAt
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		scanResultsTotalBytes -= scanResultSizeBytes(scanResults[oldest])
+		delete(scanResults, oldest)
+	}
+}
+
+func envIntWithBounds(name string, fallback, minV, maxV int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func envInt64WithBounds(name string, fallback, minV, maxV int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func isTruthyEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func initRuntimeResourceLimits() {
+	resourceLimitsOnce.Do(func() {
+		// Small VPS profile: conservative defaults, still overridable by env vars below.
+		if isTruthyEnv("ROAR_SMALL_VPS") {
+			maxConcurrentScans = 3
+			maxScanResults = 250
+			maxScanResultsBytes = 32 * 1024 * 1024
+			scanOutputCaptureBytes = 512 * 1024
+			minRuntimeFreeMemBytes = 256 * 1024 * 1024
+		}
+
+		maxConcurrentScans = envIntWithBounds("ROAR_MAX_CONCURRENT_SCANS", maxConcurrentScans, 1, 50)
+		maxScanResults = envIntWithBounds("ROAR_MAX_SCAN_RESULTS", maxScanResults, 50, 5000)
+		maxScanResultsBytes = envInt64WithBounds("ROAR_MAX_SCAN_RESULTS_BYTES", maxScanResultsBytes, 8*1024*1024, 512*1024*1024)
+		scanOutputCaptureBytes = envIntWithBounds("ROAR_SCAN_OUTPUT_CAPTURE_BYTES", scanOutputCaptureBytes, 128*1024, 8*1024*1024)
+		minRuntimeFreeMemBytes = envInt64WithBounds("ROAR_MIN_FREE_MEM_BYTES", minRuntimeFreeMemBytes, 0, 8*1024*1024*1024)
+
+		// Reinitialize semaphore with final configured capacity.
+		scanSemaphore = make(chan struct{}, maxConcurrentScans)
+		utils.GetLogger().Infof("[resource-limits] concurrent=%d, max_results=%d, cache_bytes=%d, output_capture_bytes=%d, min_free_mem_bytes=%d",
+			maxConcurrentScans, maxScanResults, maxScanResultsBytes, scanOutputCaptureBytes, minRuntimeFreeMemBytes)
+	})
+}
+
+func runtimeMemoryPreflightCheck() (bool, string) {
+	if minRuntimeFreeMemBytes <= 0 {
+		return true, ""
+	}
+	avail := availableMemoryBytes()
+	if avail <= 0 {
+		return true, ""
+	}
+	if avail < minRuntimeFreeMemBytes {
+		return false, fmt.Sprintf("insufficient free memory to start scan: available=%dMB required>=%dMB", avail/(1024*1024), minRuntimeFreeMemBytes/(1024*1024))
+	}
+	return true, ""
+}
+
+// ScanInfo is defined in commands.go
+
+type ScanResult struct {
+	ScanID      string     `json:"scan_id"`
+	Status      string     `json:"status"`
+	ScanType    string     `json:"scan_type"`
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Output      string     `json:"output,omitempty"`
+	Error       string     `json:"error,omitempty"`
+}
+
+type scanOutputCapture struct {
+	mu        sync.Mutex
+	maxBytes  int
+	buf       bytes.Buffer
+	lineBuf   string
+	resultURL string
+	truncated bool
+}
+
+func newScanOutputCapture(maxBytes int) *scanOutputCapture {
+	if maxBytes < 1 {
+		maxBytes = 256 * 1024
+	}
+	return &scanOutputCapture{maxBytes: maxBytes}
+}
+
+func (s *scanOutputCapture) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Capture only up to maxBytes to avoid unbounded memory growth.
+	if s.buf.Len() < s.maxBytes {
+		remain := s.maxBytes - s.buf.Len()
+		if len(p) <= remain {
+			_, _ = s.buf.Write(p)
+		} else {
+			_, _ = s.buf.Write(p[:remain])
+			s.truncated = true
+		}
+	} else {
+		s.truncated = true
+	}
+
+	// Parse line-by-line for R2 URLs without storing full output.
+	s.lineBuf += string(p)
+	for {
+		idx := strings.IndexByte(s.lineBuf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := strings.TrimSpace(s.lineBuf[:idx])
+		s.lineBuf = s.lineBuf[idx+1:]
+		if s.resultURL == "" && (strings.Contains(line, "Results zip uploaded:") || strings.Contains(line, "Zip file uploaded:")) {
+			if u := utils.ExtractFirstHTTPURL(line); u != "" {
+				s.resultURL = u
+			}
+		}
+	}
+	return len(p), nil
+}
+
+func (s *scanOutputCapture) OutputString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.buf.String()
+	if s.truncated {
+		out += "\n[output truncated for memory safety]\n"
+	}
+	return out
+}
+
+func (s *scanOutputCapture) ResultURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.resultURL != "" {
+		return s.resultURL
+	}
+	// Best-effort: inspect trailing buffered partial line.
+	if s.lineBuf != "" {
+		line := strings.TrimSpace(s.lineBuf)
+		if strings.Contains(line, "Results zip uploaded:") || strings.Contains(line, "Zip file uploaded:") {
+			if u := utils.ExtractFirstHTTPURL(line); u != "" {
+				s.resultURL = u
+			}
+		}
+	}
+	return s.resultURL
+}
+
+type moduleExecutionEntry struct {
+	Module         string    `json:"module"`
+	PhaseKey       string    `json:"phase_key,omitempty"` // matches the phaseKey in RunWorkflowPhase (used for log lookup)
+	Status         string    `json:"status"`              // started|completed|failed|cancelled
+	StartedAt      time.Time `json:"started_at"`
+	CompletedAt    time.Time `json:"completed_at,omitempty"`
+	DurationMS     int64     `json:"duration_ms,omitempty"`
+	OutputFiles    []string  `json:"output_files,omitempty"`
+	ScannerVersion string    `json:"scanner_version,omitempty"`
+	Command        string    `json:"command,omitempty"`
+}
+
+type scanExecutionManifest struct {
+	ScanID      string                 `json:"scan_id"`
+	ScanType    string                 `json:"scan_type"`
+	Target      string                 `json:"target"`
+	StartedAt   time.Time              `json:"started_at"`
+	CompletedAt time.Time              `json:"completed_at,omitempty"`
+	Modules     []moduleExecutionEntry `json:"modules"`
+}
+
+func writeScanManifest(scanID, scanType, target string, startedAt, completedAt time.Time, module moduleExecutionEntry) {
+	if strings.TrimSpace(scanID) == "" {
+		return
+	}
+	outDir := utils.GetScanResultsDir(scanID)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		utils.GetLogger().Infof("[manifest] mkdir failed for %s: %v", scanID, err)
+		return
+	}
+	manifest := scanExecutionManifest{
+		ScanID:      scanID,
+		ScanType:    scanType,
+		Target:      target,
+		StartedAt:   startedAt,
+		CompletedAt: completedAt,
+		Modules:     []moduleExecutionEntry{module},
+	}
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		utils.GetLogger().Infof("[manifest] marshal failed for %s: %v", scanID, err)
+		return
+	}
+	path := filepath.Join(outDir, "scan-manifest.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		utils.GetLogger().Infof("[manifest] write failed for %s: %v", scanID, err)
+	}
+}
+
+func collectScanOutputFiles(scanID string) []string {
+	arts, err := db.ListScanArtifacts(scanID)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(arts))
+	seen := make(map[string]struct{}, len(arts))
+	for _, a := range arts {
+		name := strings.TrimSpace(a.FileName)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+type ScanRequest struct {
+	Domain            *string `json:"domain"`
+	Subdomain         *string `json:"subdomain"`
+	URL               *string `json:"url"`
+	Bucket            *string `json:"bucket"`
+	Region            *string `json:"region"`
+	Repo              *string `json:"repo"`
+	Strategy          *string `json:"strategy"`
+	Pattern           *string `json:"pattern"`
+	Interval          *int    `json:"interval"`
+	All               *bool   `json:"all"`
+	Daemon            *bool   `json:"daemon"`
+	Mode              *string `json:"mode"`
+	SkipJS            *bool   `json:"skip_js"`
+	SkipFFuf          *bool   `json:"skip_ffuf"`
+	PhaseTimeout      *int    `json:"phase_timeout"`
+	TimeoutLivehosts  *int    `json:"timeout_livehosts"`
+	TimeoutReflection *int    `json:"timeout_reflection"`
+	TimeoutJS         *int    `json:"timeout_js"`
+	TimeoutNuclei     *int    `json:"timeout_nuclei"`
+	Query             *string `json:"query"`
+	Provider          *string `json:"provider"`
+	APIKey            *string `json:"api_key"`
+	Resolvers         *string `json:"resolvers"`
+	// FFuf options
+	Target         *string            `json:"target"`          // FFuf target URL
+	Wordlist       *string            `json:"wordlist"`        // FFuf wordlist path
+	Threads        *int               `json:"threads"`         // FFuf threads
+	Recursion      *bool              `json:"recursion"`       // FFuf recursion
+	RecursionDepth *int               `json:"recursion_depth"` // FFuf recursion depth
+	Bypass403      *bool              `json:"bypass_403"`      // FFuf 403 bypass
+	Extensions     *[]string          `json:"extensions"`      // FFuf extensions
+	CustomHeaders  *map[string]string `json:"custom_headers"`  // FFuf custom headers
+	// Zerodays options
+	DomainsFile          *string   `json:"domains_file"`           // Zerodays domains file
+	DOSTest              *bool     `json:"dos_test"`               // Zerodays DoS test
+	EnableSourceExposure *bool     `json:"enable_source_exposure"` // Zerodays source exposure
+	Silent               *bool     `json:"silent"`                 // Zerodays silent mode
+	CVEs                 *[]string `json:"cves"`                   // CVEs to check (CVE-2025-55182, CVE-2025-14847, CVE-2026-63030)
+	MongoDBHost          *string   `json:"mongodb_host"`           // MongoDB host for CVE-2025-14847
+	MongoDBPort          *int      `json:"mongodb_port"`           // MongoDB port for CVE-2025-14847
+	WP2ShellConfirmSQLi  *bool     `json:"wp2shell_confirm_sqli"`  // wp2shell: also run the time-based SQLi confirmation
+	// Misconfig options
+	ServiceID    *string `json:"service_id"`   // Misconfig service ID
+	Delay        *int    `json:"delay"`        // Misconfig delay (ms)
+	Permutations *bool   `json:"permutations"` // Enable permutations (slower but more thorough)
+	// DNS options
+	DNSType *string `json:"dns_type"` // DNS scan type: takeover, dangling-ip
+	// URLs options
+	SkipSubdomainEnum *bool `json:"skip_subdomain_enum"` // URLs: skip subdomain enumeration (treat as single subdomain)
+}
+
+type ScanResponse struct {
+	ScanID  string `json:"scan_id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Command string `json:"command,omitempty"`
+}
+
+type ScanStatusResponse struct {
+	ScanID      string     `json:"scan_id"`
+	Status      string     `json:"status"`
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Output      *string    `json:"output,omitempty"`
+	Error       *string    `json:"error,omitempty"`
+}
+
+// reconcileStaleScansOnStartup marks DB scans that were still "running" as failed. In-memory
+// workers are gone after restart; leaving them active confuses the dashboard.
+func reconcileStaleScansOnStartup() {
+	if err := db.Init(); err != nil {
+		return
+	}
+	if err := db.EnsureSchema(); err != nil {
+		utils.GetLogger().Infof("[WARN] EnsureSchema during stale scan reconcile: %v", err)
+	}
+	n, err := db.FailStaleActiveScans()
+	if err != nil {
+		utils.GetLogger().Infof("[WARN] Stale scan reconcile: %v", err)
+		return
+	}
+	if n > 0 {
+		utils.GetLogger().Infof("[INFO] Marked %d interrupted scan(s) as failed (API restart — no running worker).", n)
+	}
+}
+
+// Setup API routes
+func SetupAPI() *gin.Engine {
+	initRuntimeResourceLimits()
+
+	// Initialize DB once at startup — all scan goroutines share this connection.
+	// db.Init and db.EnsureSchema are idempotent (sync.Once internally).
+	if err := db.Init(); err != nil {
+		utils.GetLogger().Infof("[WARN] DB init at startup: %v", err)
+	} else if err := db.EnsureSchema(); err != nil {
+		utils.GetLogger().Infof("[WARN] DB schema at startup: %v", err)
+	}
+
+	gin.SetMode(gin.ReleaseMode)
+	gin.DefaultWriter = utils.GetLogger().Out
+	r := gin.New()
+	r.Use(gin.Recovery())
+	// Access log with the ?token= query value redacted so session JWTs passed via
+	// query string (EventSource/downloads) don't land in logs.
+	r.Use(gin.LoggerWithFormatter(func(p gin.LogFormatterParams) string {
+		return fmt.Sprintf("[GIN] %v | %3d | %13v | %15s | %-7s %s\n",
+			p.TimeStamp.Format("2006/01/02 - 15:04:05"), p.StatusCode, p.Latency,
+			p.ClientIP, p.Method, redactTokenInPath(p.Path))
+	}))
+	// Do not trust X-Forwarded-* by default — otherwise a client could spoof its
+	// IP (e.g. X-Forwarded-For: 127.0.0.1) to bypass the rate-limiter's localhost
+	// skip. Set ROAR_TRUSTED_PROXIES (comma-separated CIDRs/IPs) when behind a
+	// real reverse proxy.
+	if tp := strings.TrimSpace(os.Getenv("ROAR_TRUSTED_PROXIES")); tp != "" {
+		parts := strings.Split(tp, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		_ = r.SetTrustedProxies(parts)
+	} else {
+		_ = r.SetTrustedProxies(nil)
+	}
+
+	reconcileStaleScansOnStartup()
+
+	// Backfill findings counts for old completed scans that predate the automatic counter.
+	// Runs in the background so it does not block server startup.
+	go utils.BackfillFindingsCounts()
+
+	// CORS middleware
+	r.Use(corsMiddleware())
+
+	auth := supabaseJWTAuth()
+
+	// Root: serve dashboard UI by default.
+	r.GET("/", serveDashboardUI)
+	// API landing endpoint (non-auth) for health/info checks.
+	r.GET("/api", rootHandler)
+	r.GET("/api/", rootHandler)
+	r.GET("/health", healthHandler)
+
+	// Rate limiter for /api/* routes (skips localhost).
+	r.Use(RateLimitMiddleware())
+
+	r.GET("/metrics", auth, metricsHandler)
+	r.GET("/docs", swaggerDocsHandler)
+	r.GET("/api/openapi.json", openapiSpecHandler)
+
+	// ── Dashboard UI (embedded SPA) ──────────────────────────────────────────
+	// Both /ui and /ui/* use the same handler — no redirect loops.
+	r.GET("/ui", serveDashboardUI)
+	r.GET("/ui/*filepath", serveDashboardUI)
+	// Deep link: /scans/:scanId (same SPA; client router reads pathname)
+	r.GET("/scans", serveDashboardUI)
+	r.GET("/scans/*filepath", serveDashboardUI)
+
+	// Static data files (JSON reference tables)
+	r.GET("/static/data/*filepath", serveStaticData)
+
+	// Public: SPA reads these before login (no JWT).
+	r.GET("/api/config", apiConfigHandler)
+	r.POST("/api/settings", auth, apiUpdateSettingsHandler)
+	r.POST("/api/auth/login", apiLocalAuthLogin)
+	r.POST("/api/auth/logout", auth, apiLocalAuthLogout)
+
+	// ── Dashboard data API (protected when DASHBOARD_USER/PASSWORD is set) ───
+	apiGroup := r.Group("/api")
+	apiGroup.Use(auth)
+	{
+		apiGroup.GET("/dashboard/stats", apiDashboardStats)
+		apiGroup.GET("/domains", apiListDomains)
+		apiGroup.POST("/domains", apiAddDomain)           // single add
+		apiGroup.POST("/domains/bulk", apiAddDomainsBulk) // batch add
+		apiGroup.DELETE("/domains/:domain", apiDeleteDomain)
+		apiGroup.GET("/domains/:domain/subdomains", apiListSubdomains)
+		apiGroup.GET("/subdomains", apiAllSubdomainsPaginated)
+		apiGroup.POST("/subdomains/cnames/retry", apiRetryCnames)
+		apiGroup.GET("/subdomains/cnames/progress", apiRetryCnamesProgress)
+		apiGroup.POST("/subdomains/nuclei/run", apiRunGlobalNuclei)
+		apiGroup.POST("/subdomains/import", apiImportSubdomains)
+		apiGroup.POST("/pipeline/root-scan", apiRunRootPipeline)
+		apiGroup.GET("/scans", apiListScans)
+		apiGroup.GET("/scans/:id/results/summary", apiScanResultsSummary)
+		apiGroup.GET("/scans/:id/results/files", apiScanResultFiles)
+		apiGroup.GET("/scans/:id/results/file", apiScanResultFileContent)
+		apiGroup.GET("/scans/:id/results/download", apiScanResultFileDownload)
+		apiGroup.GET("/scans/:id/results/parsed", apiScanParsedResults)
+		apiGroup.GET("/scans/:id/results/assets", apiScanAssets)
+		apiGroup.GET("/scans/:id/results/urls", apiScanURLs)
+		apiGroup.GET("/scans/:id/artifacts", apiListScanArtifacts)
+		apiGroup.GET("/scans/:id/manifest", apiGetScanManifest)
+		apiGroup.GET("/scans/:id/logs", apiGetScanPhaseLogs)
+		apiGroup.GET("/scans/:id", apiGetScan)
+		apiGroup.GET("/scans/:id/report", apiGetScanReport)
+		apiGroup.GET("/scans/:id/logs/stream", apiStreamScanLogs)
+		apiGroup.POST("/scans/bulk-delete", apiBulkDeleteScans)
+		apiGroup.POST("/scans/clear-all", apiClearAllScans)
+		apiGroup.DELETE("/scans/:id", apiDeleteScan)
+		apiGroup.POST("/scans/:id/cancel", apiCancelScan)
+		apiGroup.POST("/scans/:id/pause", apiPauseScan)
+		apiGroup.POST("/scans/:id/resume", apiResumeScan)
+		apiGroup.POST("/scans/:id/rescan", apiRescan)
+		apiGroup.POST("/scans/recount-findings", func(c *gin.Context) {
+			go utils.BackfillFindingsCounts()
+			c.JSON(http.StatusOK, gin.H{"status": "backfill started"})
+		})
+		apiGroup.GET("/monitor/targets", apiMonitorTargets)
+		apiGroup.GET("/monitor/subdomain-targets", apiSubdomainMonitorTargets)
+		apiGroup.GET("/monitor/changes", apiMonitorChanges)
+		apiGroup.DELETE("/monitor/changes", apiClearMonitorChanges)
+		apiGroup.POST("/monitor/url-targets", apiPostMonitorURLTarget)
+		apiGroup.POST("/monitor/suggest-from-domain", apiPostMonitorSuggestFromDomain)
+		apiGroup.DELETE("/monitor/url-targets/:id", apiDeleteMonitorURLTarget)
+		apiGroup.POST("/monitor/url-targets/:id/pause", apiPauseMonitorURLTarget)
+		apiGroup.POST("/monitor/url-targets/:id/resume", apiResumeMonitorURLTarget)
+		apiGroup.POST("/monitor/subdomain-targets", apiPostMonitorSubdomainTarget)
+		apiGroup.DELETE("/monitor/subdomain-targets/:id", apiDeleteMonitorSubdomainTarget)
+		apiGroup.POST("/monitor/subdomain-targets/:id/pause", apiPauseMonitorSubdomainTarget)
+		apiGroup.POST("/monitor/subdomain-targets/:id/resume", apiResumeMonitorSubdomainTarget)
+		apiGroup.GET("/r2/files", apiR2Files)
+		apiGroup.POST("/r2/delete", apiR2Delete)
+		// Bug bounty scope / target fetch endpoints
+		apiGroup.POST("/scope/fetch", apiFetchScope)
+		apiGroup.POST("/chaos/subdomains", apiChaosSubdomains) // Chaos dataset subdomain lookup
+		apiGroup.GET("/scope/platforms", apiScopePlatforms)
+		// Multi-account management (multiple accounts per platform)
+		apiGroup.GET("/accounts", apiListBBPAccounts)
+		apiGroup.POST("/accounts", apiUpsertBBPAccount)
+		apiGroup.POST("/accounts/:id/toggle", apiToggleBBPAccount)
+		apiGroup.GET("/accounts/:id/check", apiCheckBBPAccount)
+		apiGroup.DELETE("/accounts/:id", apiDeleteBBPAccount)
+		// Program Lookup (keyword/domain → bug-bounty program) catalog
+		apiGroup.GET("/assets/program-lookup", apiProgramLookup)
+		apiGroup.POST("/assets/program-sync", apiProgramSync)
+		apiGroup.GET("/assets/catalog-status", apiCatalogStatus)
+		apiGroup.GET("/scope/programs", apiListPrograms)
+		apiGroup.POST("/scope/program-summaries", apiProgramScopeSummaries)
+		apiGroup.GET("/scope/watch-status", apiProgramWatchStatus)
+		apiGroup.POST("/scope/watch-test", apiProgramWatchTest)
+		apiGroup.GET("/scope/debug", apiProgramScopeDebug)
+		// AI finding validation & reporting
+		apiGroup.POST("/findings/validate", apiValidateFinding)
+		apiGroup.POST("/findings/report", apiReportFinding)
+		apiGroup.POST("/findings/report-batch", apiReportFindingsBatch)
+		// KeyHack templates
+		apiGroup.GET("/keyhacks", apiListKeyhacks)
+		apiGroup.GET("/keyhacks/search", apiSearchKeyhacks)
+		// System & Templates
+		apiGroup.GET("/system/metrics", apiGetSystemMetrics)
+		apiGroup.GET("/system/limits", apiGetRuntimeLimits)
+		apiGroup.GET("/nuclei/templates", apiListNucleiTemplates)
+		// Security Lab — JWT HMAC secret brute-force (client-side analyzer calls this)
+		apiGroup.POST("/jwt/brute", apiJWTBrute)
+		// Report Templates
+		apiGroup.GET("/report-templates", apiListReportTemplates)
+		apiGroup.GET("/report-templates/export", apiExportReportTemplates)
+		apiGroup.POST("/report-templates/import", apiImportReportTemplates)
+		apiGroup.GET("/report-templates/:name", apiGetReportTemplate)
+		apiGroup.POST("/report-templates", apiSaveReportTemplate)
+		apiGroup.DELETE("/report-templates/:name", apiDeleteReportTemplate)
+	}
+
+	// Scan endpoints
+	api := r.Group("/scan")
+	api.Use(auth)
+	{
+		api.POST("/domain_run", scanDomainRun)
+		api.POST("/subdomain_run", scanSubdomainRun)
+		api.POST("/subdomains", scanSubdomains)
+		api.POST("/livehosts", scanLivehosts)
+		api.POST("/cnames", scanCnames)
+		api.POST("/urls", scanURLs)
+		api.POST("/js", scanJS)
+		api.POST("/reflection", scanReflection)
+		api.POST("/nuclei", scanNuclei)
+		api.POST("/tech", scanTech)
+		api.POST("/ports", scanPorts)
+		api.POST("/gf", scanGF)
+		api.POST("/dns-takeover", scanDNSTakeover)
+		api.POST("/dns", scanDNS)              // New unified DNS endpoint (supports takeover and dangling-ip)
+		api.POST("/dns-cf1016", scanDNSCF1016) // Cloudflare 1016 dangling DNS scan
+		api.POST("/mcp-discovery", scanMCPDiscovery)
+		api.POST("/s3", scanS3)
+		api.POST("/js-endpoints", scanJSEndpoints)
+		api.POST("/github", scanGitHub)
+		api.POST("/github_org", scanGitHubOrg)
+		api.POST("/recon", scanRecon)         // Unified asset discovery: subdomains, livehosts, tech, cnames
+		api.POST("/ffuf", scanFFuf)           // FFuf fuzzing
+		api.POST("/backup", scanBackup)       // Backup file discovery
+		api.POST("/misconfig", scanMisconfig) // Cloud misconfiguration scan
+		api.POST("/zerodays", scanZerodays)   // Zerodays scan (CVE-2025-55182 React2Shell, CVE-2025-14847 MongoDB)
+		api.POST("/asr", scanASR)             // Attack Surface Reduction scan
+		api.GET("/:scan_id/status", getScanStatus)
+		api.GET("/:scan_id/results", getScanResults)
+		api.GET("/:scan_id/download", downloadScanResults)
+	}
+
+	// KeyHack endpoints
+	keyhack := r.Group("/keyhack")
+	keyhack.Use(auth)
+	{
+		keyhack.POST("/search", keyhackSearch)
+		keyhack.POST("/validate", keyhackValidate)
+	}
+
+	// Utility endpoints
+	r.POST("/cleanup", auth, cleanupHandler)
+
+	return r
+}
+
+func readInt64FromFile(path string) (int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "max" {
+		return math.MaxInt64, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func availableMemoryBytes() int64 {
+	// cgroup v2
+	if lim, err := readInt64FromFile("/sys/fs/cgroup/memory.max"); err == nil {
+		if cur, err2 := readInt64FromFile("/sys/fs/cgroup/memory.current"); err2 == nil {
+			if lim != math.MaxInt64 && lim > cur {
+				return lim - cur
+			}
+		}
+	}
+	// cgroup v1
+	if lim, err := readInt64FromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		if cur, err2 := readInt64FromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); err2 == nil {
+			if lim > 0 && lim < (1<<62) && lim > cur {
+				return lim - cur
+			}
+		}
+	}
+	// Host fallback (/proc/meminfo)
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "MemAvailable:") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			if kb, err := strconv.ParseInt(parts[1], 10, 64); err == nil && kb > 0 {
+				return kb * 1024
+			}
+		}
+	}
+	return -1
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	allowedOrigins := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	devMode := strings.EqualFold(strings.TrimSpace(os.Getenv("ROAR_ENV")), "development")
+
+	if allowedOrigins == "" && !devMode {
+		utils.GetLogger().Infof("[CORS] CORS_ALLOWED_ORIGINS is not set and ROAR_ENV != development — cross-origin requests are denied. Set CORS_ALLOWED_ORIGINS or ROAR_ENV=development to enable.")
+	} else if allowedOrigins == "" && devMode {
+		utils.GetLogger().Infof("[CORS] Development mode — API accepts cross-origin requests from ANY origin. Do not use ROAR_ENV=development in production.")
+	}
+
+	return func(c *gin.Context) {
+		origin := c.Request.Header.Get("Origin")
+		if allowedOrigins != "" {
+			// Explicit allow-list: only echo the origin back if it matches.
+			for _, o := range strings.Split(allowedOrigins, ",") {
+				if strings.TrimSpace(o) == origin && origin != "" {
+					c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+					c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+					break
+				}
+			}
+		} else if devMode {
+			// Development only: allow all origins.
+			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		// Production default: no Access-Control-Allow-Origin header → same-origin only.
+
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func rootHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"message": "ROAR API Server",
+		"version": version.Version,
+		"docs":    "/docs",
+		"status":  "operational",
+	})
+}
+
+// getMetricsSnapshot returns basic metrics for the API
+func getMetricsSnapshot() map[string]interface{} {
+	ScansMutex.RLock()
+	activeCount := len(ActiveScans)
+	ScansMutex.RUnlock()
+
+	return map[string]interface{}{
+		"active_scans": activeCount,
+		"message":      "API running smoothly",
+	}
+}
+
+func healthHandler(c *gin.Context) {
+	snapshot := getMetricsSnapshot()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":       "healthy",
+		"timestamp":    time.Now().UTC().Format(time.RFC3339),
+		"uptime":       snapshot["uptime"],
+		"active_scans": snapshot["active_scans"],
+	})
+}
+
+func metricsHandler(c *gin.Context) {
+	snapshot := getMetricsSnapshot()
+	c.JSON(http.StatusOK, snapshot)
+}
+
+func cleanupHandler(c *gin.Context) {
+	// Execute cleanup via CLI command to avoid import cycle
+	scanID := generateScanID()
+	command := []string{
+		utils.GetROARScriptPath(),
+		"cleanup",
+	}
+
+	go executeScan(scanID, command, "cleanup")
+
+	c.JSON(http.StatusOK, gin.H{
+		"scan_id": scanID,
+		"status":  "started",
+		"message": "Cleanup started",
+		"command": strings.Join(command, " "),
+	})
+}
+
+func docsHandler(c *gin.Context) {
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROAR API Documentation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        header {
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+        h1 {
+            color: #58a6ff;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        .version {
+            color: #8b949e;
+            font-size: 1.1em;
+        }
+        .endpoint {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .method {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 3px;
+            font-weight: bold;
+            font-size: 0.85em;
+            margin-right: 10px;
+        }
+        .method.post { background: #238636; color: white; }
+        .method.get { background: #1f6feb; color: white; }
+        .endpoint-path {
+            font-family: 'Courier New', monospace;
+            font-size: 1.1em;
+            color: #58a6ff;
+            margin-bottom: 10px;
+        }
+        .description {
+            color: #8b949e;
+            margin-bottom: 15px;
+        }
+        .example {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 10px;
+            overflow-x: auto;
+        }
+        .example code {
+            color: #c9d1d9;
+            font-family: 'Courier New', monospace;
+        }
+        .section {
+            margin-top: 40px;
+        }
+        .section-title {
+            color: #58a6ff;
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 10px;
+        }
+        a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>ROAR API Documentation</h1>
+            <div class="version">Version ` + version.Version + `</div>
+        </header>
+
+        <div class="section">
+            <h2 class="section-title">Base Information</h2>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /</div>
+                <div class="description">API root endpoint - returns API information</div>
+            </div>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /health</div>
+                <div class="description">Health check endpoint</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Scan Endpoints</h2>
+            
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/subdomains</div>
+                <div class="description">Enumerate subdomains for a domain</div>
+                <div class="example">
+                    <code>curl -X POST http://localhost:8000/scan/subdomains \<br>
+&nbsp;&nbsp;-H "Content-Type: application/json" \<br>
+&nbsp;&nbsp;-d '{"domain": "example.com"}'</code>
+                </div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/livehosts</div>
+                <div class="description">Filter live hosts from subdomains</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/cnames</div>
+                <div class="description">Collect CNAME records for domain subdomains</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/urls</div>
+                <div class="description">Collect URLs and JS URLs</div>
+                <div class="example">
+                    <code>curl -X POST http://localhost:8000/scan/urls \<br>
+&nbsp;&nbsp;-H "Content-Type: application/json" \<br>
+&nbsp;&nbsp;-d '{"domain": "example.com", "skip_subdomain_enum": false}'</code>
+                </div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/js</div>
+                <div class="description">JavaScript scan (JS URLs)</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/reflection</div>
+                <div class="description">Reflection scan (kxss)</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/nuclei</div>
+                <div class="description">Run Nuclei templates</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/tech</div>
+                <div class="description">Technology detection</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/ports</div>
+                <div class="description">Port scanning with Naabu</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/gf</div>
+                <div class="description">GF patterns scan</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/dns</div>
+                <div class="description">DNS scan (takeover or dangling-ip detection)</div>
+                <div class="example">
+                    <code>curl -X POST http://localhost:8000/scan/dns \<br>
+&nbsp;&nbsp;-H "Content-Type: application/json" \<br>
+&nbsp;&nbsp;-d '{"domain": "example.com", "dns_type": "takeover"}'</code>
+                </div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/s3</div>
+                <div class="description">S3 bucket scanning</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/github</div>
+                <div class="description">GitHub repository scanning</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/github_org</div>
+                <div class="description">GitHub organization scanning</div>
+            </div>
+
+            
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/ffuf</div>
+                <div class="description">FFuf web fuzzing</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/backup</div>
+                <div class="description">Backup file discovery</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/misconfig</div>
+                <div class="description">Cloud misconfiguration scanning</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /scan/zerodays</div>
+                <div class="description">Zerodays scan (CVE-2025-55182 React2Shell, CVE-2025-14847 MongoDB)</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /scan/:scan_id/status</div>
+                <div class="description">Get scan status by scan ID</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /scan/:scan_id/results</div>
+                <div class="description">Get scan results by scan ID</div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /scan/:scan_id/download</div>
+                <div class="description">Download scan results as archive</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">KeyHack Endpoints</h2>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /keyhack/search</div>
+                <div class="description">Search for API keys</div>
+            </div>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /keyhack/validate</div>
+                <div class="description">Validate API keys</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Utility Endpoints</h2>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method get">GET</span> /scans</div>
+                <div class="description">List all scans (active and completed)</div>
+            </div>
+            <div class="endpoint">
+                <div class="endpoint-path"><span class="method post">POST</span> /cleanup</div>
+                <div class="description">Clean up the entire results directory</div>
+                <div class="example">
+                    <code>curl -X POST http://localhost:8000/cleanup</code>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Request Format</h2>
+            <div class="endpoint">
+                <div class="description">
+                    All POST endpoints accept JSON in the following format:
+                </div>
+                <div class="example">
+                    <code>{<br>
+&nbsp;&nbsp;"domain": "example.com",<br>
+&nbsp;&nbsp;"threads": 100,<br>
+&nbsp;&nbsp;"skip_subdomain_enum": false<br>
+}</code>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Response Format</h2>
+            <div class="endpoint">
+                <div class="description">
+                    Successful scan initiation returns:
+                </div>
+                <div class="example">
+                    <code>{<br>
+&nbsp;&nbsp;"scan_id": "abc123...",<br>
+&nbsp;&nbsp;"status": "started",<br>
+&nbsp;&nbsp;"message": "Scan started for example.com",<br>
+&nbsp;&nbsp;"command": "roar scan ..."<br>
+}</code>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>`
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(html))
+}
+func getScanStatus(c *gin.Context) {
+	scanID := c.Param("scan_id")
+
+	// Check active in-memory scans first (fastest path).
+	ScansMutex.RLock()
+	activeScan, inActive := ActiveScans[scanID]
+	ScansMutex.RUnlock()
+
+	if inActive {
+		c.JSON(http.StatusOK, ScanStatusResponse{
+			ScanID:      scanID,
+			Status:      activeScan.Status,
+			StartedAt:   activeScan.StartedAt,
+			CompletedAt: activeScan.CompletedAt,
+			Output:      nil,
+			Error:       nil,
+		})
+		return
+	}
+
+	// Check in-memory completed results cache.
+	apiScansMutex.RLock()
+	scan, inResults := scanResults[scanID]
+	apiScansMutex.RUnlock()
+
+	if inResults {
+		var output *string
+		var scanErr *string
+		if scan.Output != "" {
+			output = &scan.Output
+		}
+		if scan.Error != "" {
+			scanErr = &scan.Error
+		}
+		c.JSON(http.StatusOK, ScanStatusResponse{
+			ScanID:      scanID,
+			Status:      scan.Status,
+			StartedAt:   scan.StartedAt,
+			CompletedAt: scan.CompletedAt,
+			Output:      output,
+			Error:       scanErr,
+		})
+		return
+	}
+
+	// #6: Fall through to DB — covers scans that survived a server restart.
+	if dbScan, err := db.GetScan(scanID); err == nil && dbScan != nil {
+		c.JSON(http.StatusOK, ScanStatusResponse{
+			ScanID:      scanID,
+			Status:      dbScan.Status,
+			StartedAt:   dbScan.StartedAt,
+			CompletedAt: dbScan.CompletedAt,
+			Output:      nil,
+			Error:       nil,
+		})
+		return
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "Scan not found"})
+}
+
+func getScanResults(c *gin.Context) {
+	scanID := c.Param("scan_id")
+
+	apiScansMutex.RLock()
+	defer apiScansMutex.RUnlock()
+
+	if scan, ok := scanResults[scanID]; ok {
+		c.JSON(http.StatusOK, scan)
+		return
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "Scan results not found"})
+}
+
+func downloadScanResults(c *gin.Context) {
+	scanID := c.Param("scan_id")
+
+	apiScansMutex.RLock()
+	scan, ok := scanResults[scanID]
+	apiScansMutex.RUnlock()
+
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Scan results not found"})
+		return
+	}
+
+	// Create temporary file
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("scan-%s-*.txt", scanID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temp file"})
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+
+	// Write results to file
+	fmt.Fprintf(tmpFile, "Scan ID: %s\n", scanID)
+	fmt.Fprintf(tmpFile, "Scan Type: %s\n", scan.ScanType)
+	fmt.Fprintf(tmpFile, "Status: %s\n", scan.Status)
+	fmt.Fprintf(tmpFile, "Started: %s\n", scan.StartedAt.Format(time.RFC3339))
+	if scan.CompletedAt != nil {
+		fmt.Fprintf(tmpFile, "Completed: %s\n", scan.CompletedAt.Format(time.RFC3339))
+	}
+	fmt.Fprintf(tmpFile, "\n%s\n", strings.Repeat("=", 80))
+	fmt.Fprintf(tmpFile, "OUTPUT:\n")
+	fmt.Fprintf(tmpFile, "%s\n\n", strings.Repeat("=", 80))
+	fmt.Fprintf(tmpFile, "%s\n", scan.Output)
+
+	if scan.Error != "" {
+		fmt.Fprintf(tmpFile, "\n\n%s\n", strings.Repeat("=", 80))
+		fmt.Fprintf(tmpFile, "ERRORS:\n")
+		fmt.Fprintf(tmpFile, "%s\n\n", strings.Repeat("=", 80))
+		fmt.Fprintf(tmpFile, "%s\n", scan.Error)
+	}
+
+	tmpFile.Close()
+
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=scan-%s-results.txt", scanID))
+	c.File(tmpFile.Name())
+}
+
+// Helper functions
+
+// generateScanID returns a cryptographically random UUID v4 (#1).
+// Using time.Now().UnixNano() was collision-prone under concurrent load and guessable.
+func generateScanID() string {
+	return uuid.New().String()
+}
+
+// extractScanTargetFromCommand infers the human-readable target from command arguments (#11).
+func extractScanTargetFromCommand(command []string, scanType string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	st := strings.ToLower(scanType)
+	for i := 0; i < len(command)-1; i++ {
+		arg := command[i]
+		next := command[i+1]
+		if next == "" {
+			continue
+		}
+		switch arg {
+		case "-d", "--domain", "-s", "--subdomain":
+			return next
+		}
+	}
+	for i := 0; i < len(command)-1; i++ {
+		arg := command[i]
+		next := command[i+1]
+		if next == "" {
+			continue
+		}
+		switch {
+		case arg == "-u" || arg == "--url":
+			return next
+		case (st == "s3") && (arg == "-b" || arg == "--bucket"):
+			return next
+		case (st == "github" || st == "github_scan") && arg == "-r":
+			return next
+		case st == "github_org" && arg == "-o":
+			return next
+		case st == "zerodays" && arg == "-f":
+			return "file:" + filepath.Base(next)
+		}
+	}
+	return ""
+}
+
+func executeScan(scanID string, command []string, scanType string) {
+	initRuntimeResourceLimits()
+	startedAt := time.Now()
+
+	target := extractScanTargetFromCommand(command, scanType)
+	if target == "" {
+		// #11: Use a descriptive label, never just the raw scanType as if it were a domain.
+		target = "[" + scanType + "]"
+	}
+
+	if ok, msg := runtimeMemoryPreflightCheck(); !ok {
+		utils.GetLogger().Infof("[executeScan] refusing to start scan %s (%s): %s", scanID, scanType, msg)
+		completedAt := time.Now()
+		_ = db.Init()
+		_ = db.EnsureSchema()
+		_ = db.CreateScan(&db.ScanRecord{
+			ScanID:     scanID,
+			ScanType:   scanType,
+			Target:     target,
+			Status:     "failed",
+			StartedAt:  startedAt,
+			LastUpdate: completedAt,
+			Command:    strings.Join(command, " "),
+		})
+		_ = db.UpdateScanResult(scanID, "failed", "")
+		writeScanManifest(scanID, scanType, target, startedAt, completedAt, moduleExecutionEntry{
+			Module:         scanType,
+			Status:         "failed",
+			StartedAt:      startedAt,
+			CompletedAt:    completedAt,
+			DurationMS:     completedAt.Sub(startedAt).Milliseconds(),
+			ScannerVersion: version.Version,
+			Command:        strings.Join(command, " "),
+		})
+		apiScansMutex.Lock()
+		result := &ScanResult{
+			ScanID:      scanID,
+			Status:      "failed",
+			ScanType:    scanType,
+			StartedAt:   startedAt,
+			CompletedAt: &completedAt,
+			Error:       msg,
+		}
+		storeScanResultLocked(scanID, result)
+		apiScansMutex.Unlock()
+		return
+	}
+
+	// #2: Acquire semaphore slot — blocks if maxConcurrentScans are already running.
+	scanSemaphore <- struct{}{}
+	defer func() { <-scanSemaphore }()
+
+	ScansMutex.Lock()
+	ActiveScans[scanID] = &ScanInfo{
+		ScanID:    scanID,
+		Status:    "running",
+		ScanType:  scanType,
+		Target:    target,
+		StartedAt: startedAt,
+		Command:   strings.Join(command, " "),
+	}
+	ScansMutex.Unlock()
+
+	// Set initial total phases based on scan type.
+	// Workflow scans (domain_run / subdomain_run) track ~18 sub-phases via the
+	// subprocess; atomic one-shot scans (cf1016, misconfig, s3, …) are a single
+	// indivisible step and should show 0 phases so the UI never shows phantom
+	// "skipped" stages.
+	initialTotalPhases := 0 // default: no sub-phase tracking
+	switch scanType {
+	case "domain_run", "subdomain_run":
+		initialTotalPhases = 18
+	}
+	dbRecord := &db.ScanRecord{
+		ScanID:      scanID,
+		ScanType:    scanType,
+		Target:      target,
+		Status:      "running",
+		TotalPhases: initialTotalPhases,
+		StartedAt:   startedAt,
+		LastUpdate:  startedAt,
+		Command:     strings.Join(command, " "),
+	}
+	if err := db.CreateScan(dbRecord); err != nil {
+		utils.GetLogger().Infof("[executeScan] Failed to create DB scan record for %s: %v", scanID, err)
+	}
+	writeScanManifest(scanID, scanType, target, startedAt, time.Time{}, moduleExecutionEntry{
+		Module:         scanType,
+		Status:         "started",
+		StartedAt:      startedAt,
+		ScannerVersion: version.Version,
+		Command:        strings.Join(command, " "),
+	})
+
+	// Notify scan start via webhook
+	utils.SendScanNotification("start", scanID, target, scanType, "running", 0)
+
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Env = sanitizeEnv(os.Environ(), "ROAR_CURRENT_SCAN_ID", scanID)
+	// Process-group setup is platform-specific. Unix uses a process group so
+	// cancellation reaches scanner children; Windows falls back to the child.
+	configureScanProcess(cmd)
+	capture := newScanOutputCapture(scanOutputCaptureBytes)
+	// Stream output to console while capturing a bounded window.
+	multi := io.MultiWriter(os.Stdout, capture)
+	cmd.Stdout = multi
+	cmd.Stderr = multi
+
+	if err := cmd.Start(); err != nil {
+		utils.GetLogger().Infof("[executeScan] Failed to start scan %s: %v", scanID, err)
+		completedAt := time.Now()
+		_ = db.UpdateScanResult(scanID, "failed", "")
+		ScansMutex.Lock()
+		delete(ActiveScans, scanID)
+		ScansMutex.Unlock()
+		apiScansMutex.Lock()
+		newResult := &ScanResult{
+			ScanID: scanID, Status: "failed", ScanType: scanType,
+			StartedAt: startedAt, CompletedAt: &completedAt, Error: err.Error(),
+		}
+		storeScanResultLocked(scanID, newResult)
+		apiScansMutex.Unlock()
+		return
+	}
+
+	ScansMutex.Lock()
+	if s, ok := ActiveScans[scanID]; ok {
+		s.ExecCmd = cmd
+	}
+	ScansMutex.Unlock()
+
+	err := cmd.Wait()
+	output := []byte(capture.OutputString())
+	completedAt := time.Now()
+
+	ScansMutex.Lock()
+	si, stillThere := ActiveScans[scanID]
+	cancelled := stillThere && si != nil && si.CancelRequested
+	ScansMutex.Unlock()
+
+	// Determine final status
+	finalStatus := "completed"
+	if cancelled {
+		finalStatus = "cancelled"
+	} else if err != nil {
+		finalStatus = "failed"
+		utils.GetLogger().Infof("[executeScan] Scan %s (%s) failed: %v", scanID, scanType, err)
+	}
+
+	// Extract R2 result URL from output if any
+	resultURL := capture.ResultURL()
+	if resultURL == "" {
+		resultURL = utils.ExtractR2ZipURLFromOutput(string(output))
+	}
+	if resultURL != "" {
+		utils.GetLogger().Infof("[executeScan] Extracted result URL for scan %s: %s", scanID, resultURL)
+	}
+
+	// Update DB status and result URL
+	if dbErr := db.UpdateScanResult(scanID, finalStatus, resultURL); dbErr != nil {
+		utils.GetLogger().Infof("[executeScan] Failed to update DB status for %s: %v", scanID, dbErr)
+	}
+
+	// Count findings for final notification
+	findingsCount := 0
+	if artifacts, err := db.ListScanArtifacts(scanID); err == nil {
+		for _, a := range artifacts {
+			if a.Category == "vulnerability" {
+				findingsCount += a.LineCount
+			}
+		}
+	}
+	utils.SendScanNotification("finish", scanID, target, scanType, finalStatus, findingsCount)
+
+	// For atomic one-shot scans: mark the scan's single task as completed/failed
+	// so the dashboard shows a clean result instead of "0 done · N skipped".
+	if initialTotalPhases == 0 {
+		scanLabel := map[string]string{
+			"dns_cf1016": "CF1016 Dangling DNS", "dns-cf1016": "CF1016 Dangling DNS",
+			"mcp-discovery": "MCP Discovery",
+			"misconfig":     "Misconfiguration", "s3": "S3 Bucket",
+			"github": "GitHub Recon", "github_org": "GitHub Org Recon",
+			"dns-takeover": "DNS Takeover", "dns-dangling-ip": "Dangling IP",
+			"nuclei": "Nuclei Scan", "tech": "Tech Detection",
+			"ports": "Port Scan", "gf": "GF Patterns",
+		}[scanType]
+		if scanLabel == "" {
+			scanLabel = scanType
+		}
+		phaseEntry := scanLabel + " scan"
+		phaseFailed := finalStatus == "failed"
+		_ = db.AppendScanPhase(scanID, phaseEntry, phaseFailed)
+		// Also update total_phases to 1 so the UI can compute 100%.
+		progress := &db.ScanProgress{
+			CurrentPhase:    1,
+			TotalPhases:     1,
+			PhaseName:       phaseEntry,
+			CompletedPhases: []string{phaseEntry},
+		}
+		if phaseFailed {
+			progress.CompletedPhases = nil
+		}
+		_ = db.UpdateScanProgress(scanID, progress)
+	}
+
+	// For subdomain_run: index the scanned subdomain into the domain DB so it
+	// appears in the Subdomains tab under the correct root domain.
+	if scanType == "subdomain_run" && finalStatus == "completed" && target != "" {
+		go func(sub string) {
+			rootDomain := extractRootDomain(sub)
+			if rootDomain == "" {
+				rootDomain = sub
+			}
+			if _, err := db.InsertOrGetDomain(rootDomain); err != nil {
+				utils.GetLogger().Infof("[executeScan] failed to upsert domain %s for subdomain_run: %v", rootDomain, err)
+				return
+			}
+			if err := db.InsertSubdomain(rootDomain, sub, true, "https://"+sub, "", 200, 0); err != nil {
+				utils.GetLogger().Infof("[executeScan] failed to insert subdomain %s under %s: %v", sub, rootDomain, err)
+			} else {
+				utils.GetLogger().Infof("[executeScan] indexed subdomain %s under root domain %s", sub, rootDomain)
+			}
+		}(target)
+	}
+	// Always save full console log for the dashboard
+	logPath := filepath.Join(utils.GetScanResultsDir(scanID), "scan.log")
+	_ = os.WriteFile(logPath, output, 0644)
+	if _, statErr := os.Stat(logPath); statErr == nil {
+		if _, err := utils.IndexExistingResultFile(scanID, logPath); err != nil {
+			utils.GetLogger().Infof("[executeScan] Failed to index scan.log: %v", err)
+		}
+	} else if !os.IsNotExist(statErr) {
+		utils.GetLogger().Infof("[executeScan] scan.log stat failed: %v", statErr)
+	}
+
+	// Index any final tool-generated artifacts (nuclei/ffuf/gf/tech/etc) that bypass wrappers.
+	indexScanArtifacts(scanID, scanType, target)
+	// domain_run / subdomain_run delete local results after upload — backfill from R2 for the UI table.
+	IndexWorkflowArtifactsFromR2(scanID, scanType, target)
+	outputFiles := collectScanOutputFiles(scanID)
+	durationMS := completedAt.Sub(startedAt).Milliseconds()
+	writeScanManifest(scanID, scanType, target, startedAt, completedAt, moduleExecutionEntry{
+		Module:         scanType,
+		Status:         finalStatus,
+		StartedAt:      startedAt,
+		CompletedAt:    completedAt,
+		DurationMS:     durationMS,
+		OutputFiles:    outputFiles,
+		ScannerVersion: version.Version,
+		Command:        strings.Join(command, " "),
+	})
+
+	ScansMutex.Lock()
+	delete(ActiveScans, scanID)
+	ScansMutex.Unlock()
+
+	apiScansMutex.Lock()
+	defer apiScansMutex.Unlock()
+
+	// Add to in-memory results cache
+	result := &ScanResult{
+		ScanID:      scanID,
+		Status:      finalStatus,
+		ScanType:    scanType,
+		StartedAt:   startedAt,
+		CompletedAt: &completedAt,
+		Output:      string(output),
+	}
+
+	if err != nil && finalStatus != "cancelled" {
+		result.Error = err.Error()
+	}
+	if finalStatus == "cancelled" {
+		result.Error = "cancelled by user"
+	}
+
+	storeScanResultLocked(scanID, result)
+}
+
+func indexScanArtifacts(scanID, scanType, target string) {
+	resultsDir := utils.GetResultsDir()
+	if scanID == "" || resultsDir == "" {
+		return
+	}
+	roots := make([]string, 0, 8)
+
+	// Scan types that write to new-results/<target>/ (the full domain dir).
+	// These are workflow scans that own the entire target directory.
+	domainRootTypes := map[string]bool{
+		"domain_run": true, "subdomain_run": true,
+		"subdomains": true, "livehosts": true, "cnames": true,
+		"urls": true, "js": true, "jsscan": true, "reflection": true,
+		"nuclei": true, "tech": true, "ports": true, "gf": true,
+		"backup": true, "aem": true, "depconfusion": true, "wp_confusion": true,
+		"zerodays": true, "pipeline": true,
+	}
+
+	if domainRootTypes[scanType] && target != "" {
+		roots = append(roots, filepath.Join(resultsDir, target))
+	}
+
+	switch scanType {
+	case "misconfig":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, "misconfig", target))
+			roots = append(roots, filepath.Join(resultsDir, target, "misconfig"))
+		}
+	case "s3":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, "s3", target))
+		}
+	case "github":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, "github", "repos", target))
+		}
+	case "github_org":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, "github", "orgs", target))
+		}
+	// DNS-specific scans: only index from their specific output dir, never the whole domain root.
+	case "dns-takeover", "dns-dangling-ip":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, target, "vulnerabilities", "dns-takeover"))
+		}
+	case "dns_cf1016", "dns-cf1016":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, target, "vulnerabilities", "cf1016"))
+			// Also pick up enumerated subdomains file (all-subs.txt / live-subs.txt written by the enumeration step)
+			roots = append(roots, filepath.Join(resultsDir, target, "subs"))
+		}
+	case "dns-takeover-legacy", "dns_takeover_legacy":
+		if target != "" {
+			roots = append(roots, filepath.Join(resultsDir, target, "vulnerabilities", "dns-takeover"))
+		}
+	}
+
+	// Ensure scan results directory exists for local-first file storage
+	scanResultsDir := utils.GetScanResultsDir(scanID)
+	_ = os.MkdirAll(scanResultsDir, 0755)
+
+	seen := map[string]struct{}{}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			if shouldSkipArtifact(path) {
+				return nil
+			}
+			if _, ok := seen[path]; ok {
+				return nil
+			}
+			seen[path] = struct{}{}
+
+			// Copy file to scan results directory for local-first access
+			fileName := filepath.Base(path)
+			destPath := filepath.Join(scanResultsDir, fileName)
+			if _, statErr := os.Stat(destPath); statErr != nil {
+				if data, readErr := os.ReadFile(path); readErr == nil {
+					if writeErr := os.WriteFile(destPath, data, 0644); writeErr != nil {
+						utils.GetLogger().Infof("[executeScan] failed to copy %s to scan dir: %v", fileName, writeErr)
+					}
+				}
+			}
+
+			// Legacy: still index for backward compat
+			if _, idxErr := utils.IndexExistingResultFile(scanID, path); idxErr != nil {
+				utils.GetLogger().Infof("[executeScan] index artifact failed (%s): %v", path, idxErr)
+			}
+			return nil
+		})
+	}
+}
+
+// targetHostForR2Prefixes mirrors the UI r2PrefixesForScan hostname normalization (app.js).
+func targetHostForR2Prefixes(target string) string {
+	t := strings.TrimSpace(target)
+	t = strings.TrimPrefix(strings.TrimPrefix(t, "http://"), "https://")
+	if i := strings.Index(t, "/"); i >= 0 {
+		t = t[:i]
+	}
+	t = strings.TrimPrefix(strings.ToLower(t), "www.")
+	return t
+}
+
+// workflowScanR2Prefixes returns R2 key prefixes used for domain_run / subdomain_run (matches app.js default branch).
+func workflowScanR2Prefixes(target string) []string {
+	h := targetHostForR2Prefixes(target)
+	if h == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	add("new-results/" + h + "/")
+	add("results/" + h + "/")
+	add("new-results/misconfig/" + h + "/")
+	add("misconfig/" + h + "/")
+	return out
+}
+
+// isR2KeyIndexableArtifact matches shouldSkipArtifact extension rules for workflow backfill.
+func isR2KeyIndexableArtifact(key string) bool {
+	name := strings.ToLower(filepath.Base(key))
+	if name == "scan-manifest.json" || name == "cache_info.json" || name == "report-table.json" {
+		return false
+	}
+	if strings.HasPrefix(name, ".lite-uploads-") {
+		return false
+	}
+	if strings.HasPrefix(name, "temp-") || strings.Contains(name, "dangling-ip-temp") {
+		return false
+	}
+	if strings.EqualFold(name, "temp-url.txt") {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".txt", ".json", ".log", ".csv", ".html", ".md", ".bin", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+// indexWorkflowArtifactsFromR2 populates scan_artifacts from R2 listings for domain_run / subdomain_run.
+// These scan types delete local result dirs on completion, so post-scan
+// filesystem indexing finds nothing; uploads still land in R2. Backfilling here makes the scan modal
+// use the same indexed-artifact table as other scans instead of the raw R2 fallback.
+func IndexWorkflowArtifactsFromR2(scanID, scanType, target string) {
+	st := strings.ToLower(strings.TrimSpace(scanType))
+
+	var r2Prefixes []string
+	switch st {
+	case "domain_run", "subdomain_run":
+		r2Prefixes = workflowScanR2Prefixes(target)
+	case "github", "github_org":
+		slug := target
+		if strings.Contains(target, "/") {
+			parts := strings.Split(target, "/")
+			slug = parts[len(parts)-1]
+		}
+		r2Prefixes = []string{
+			"new-results/" + scanID + "/",
+			"new-results/" + scanID + "/github-secrets.json",
+			"new-results/github/repos/" + slug + "/",
+			"new-results/github/repos/" + target + "/",
+			"new-results/github/orgs/" + target + "/",
+		}
+		utils.GetLogger().Infof("[indexWorkflowArtifactsFromR2] github scan: scanID=%s target=%s slug=%s", scanID, target, slug)
+	}
+
+	if len(r2Prefixes) == 0 || strings.TrimSpace(scanID) == "" || !r2storage.IsEnabled() {
+		return
+	}
+	seenKey := map[string]struct{}{}
+	for _, prefix := range r2Prefixes {
+		objs, err := r2storage.ListObjectsRecursive(prefix)
+		if err != nil {
+			utils.GetLogger().Infof("[indexWorkflowArtifactsFromR2] list prefix %q: %v", prefix, err)
+			continue
+		}
+		for _, o := range objs {
+			if o.Size == 0 {
+				continue
+			}
+			if !isR2KeyIndexableArtifact(o.Key) {
+				continue
+			}
+			if _, dup := seenKey[o.Key]; dup {
+				continue
+			}
+			seenKey[o.Key] = struct{}{}
+			pub := r2storage.PublicURLForKey(o.Key)
+			if pub == "" {
+				continue
+			}
+			art := &db.ScanArtifact{
+				ScanID:    scanID,
+				FileName:  filepath.Base(o.Key),
+				R2Key:     o.Key,
+				PublicURL: pub,
+				SizeBytes: o.Size,
+				CreatedAt: o.LastModified,
+			}
+			if err := db.AppendScanArtifact(art); err != nil {
+				utils.GetLogger().Infof("[indexWorkflowArtifactsFromR2] append %s: %v", o.Key, err)
+			}
+		}
+	}
+}
+
+func shouldSkipArtifact(path string) bool {
+	name := strings.ToLower(filepath.Ext(path))
+	if name == ".log" || name == ".txt" || name == ".json" || name == ".csv" || name == ".html" || name == ".md" {
+		// keep these
+	} else {
+		// skip others by default
+		// return true
+	}
+
+	base := strings.ToLower(filepath.Base(path))
+	if base == "scan-manifest.json" || base == "cache_info.json" || base == "report-table.json" {
+		return true
+	}
+
+	skipByName := []string{
+		"misconfig-scan-results.txt",
+		"ffuf-results.txt",
+		"ffuf-webhook-messages.txt",
+		"kxss-results.txt",
+		"exposure-findings.txt",
+		"wp-confusion-results.txt",
+		"js-secrets.txt",
+		"nuclei-summary.txt",
+		"all-subs.txt",
+		"live-subs.txt",
+		"live-hosts.txt",
+		"all-urls.txt",
+		"subdomains.txt",
+		"enumerated-subs.txt",
+		"urls.json",
+		"js-urls.json",
+		"subdomains.json",
+		"ports.json",
+		"livehosts.json",
+		"cname-records.json",
+	}
+	for _, skip := range skipByName {
+		if strings.EqualFold(base, skip) {
+			return true
+		}
+	}
+
+	return false
+}

@@ -1,0 +1,138 @@
+name: Release
+
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Verify Go version
+        run: go version
+
+      - name: Build ROAR binary
+        run: |
+          CGO_ENABLED=1 go build -o roar ./cmd/roar
+          chmod +x roar
+
+      - name: Test build
+        run: |
+          ./roar --help || true
+
+      - name: Gitleaks scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+
+      - name: Create release archive
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          # Create release directory
+          mkdir -p release
+          
+          # Copy binary
+          cp roar release/
+          
+          # Copy essential directories (submodules are optional)
+          [ -d nuclei_templates ] && cp -r nuclei_templates/ release/ || echo "nuclei_templates not found, skipping"
+          [ -d Wordlists ] && cp -r Wordlists/ release/ || echo "Wordlists not found, skipping"
+          [ -d regexes ] && cp -r regexes/ release/ || echo "regexes not found, skipping"
+          [ -d templates ] && cp -r templates/ release/ || echo "templates not found, skipping"
+          
+          # Copy configuration files
+          [ -f env.example ] && cp env.example release/ || true
+          [ -f docker-compose.yml ] && cp docker-compose.yml release/ || true
+          [ -f Dockerfile ] && cp Dockerfile release/ || true
+          [ -f README.md ] && cp README.md release/ || true
+          [ -f go.mod ] && cp go.mod release/ || true
+          [ -f go.sum ] && cp go.sum release/ || true
+          
+          # Create archives
+          tar -czf roar-${GITHUB_REF_NAME}-linux-amd64.tar.gz -C release .
+          zip -r roar-${GITHUB_REF_NAME}-linux-amd64.zip release/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ROAR ${{ github.ref_name }}
+          files: |
+            roar-*.tar.gz
+            roar-*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/roar
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Single platform: CGO + Dockerfile are tuned for amd64; add arm64 when cross-build is verified.
+          platforms: linux/amd64
