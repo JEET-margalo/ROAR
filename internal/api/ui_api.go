@@ -64,19 +64,19 @@ func apiConfigHandler(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"subfinder_key_counts": subfinderKeyCounts,
-		"version":         version.Version,
-		"r2_enabled":      r2storage.IsEnabled(),
-		"r2_public_url":   os.Getenv("R2_PUBLIC_URL"),
-		"r2_bucket":       os.Getenv("R2_BUCKET_NAME"),
+		"version":              version.Version,
+		"r2_enabled":           r2storage.IsEnabled(),
+		"r2_public_url":        os.Getenv("R2_PUBLIC_URL"),
+		"r2_bucket":            os.Getenv("R2_BUCKET_NAME"),
 		// R2 account ID is an identifier (appears in the endpoint URL), safe to echo so
 		// the field prefills; the two API keys are secrets — only their set-state is returned.
 		"r2_account_id":     os.Getenv("R2_ACCOUNT_ID"),
 		"r2_access_key_set": strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")) != "",
 		"r2_secret_key_set": strings.TrimSpace(os.Getenv("R2_SECRET_KEY")) != "",
-		"auth_enabled":    authOn,
-		"auth_provider":   "local",
-		"db_type":         utils.GetEnv("DB_TYPE", "postgresql"),
-		"mode":            utils.GetEnv("ROAR_MODE", "api"),
+		"auth_enabled":      authOn,
+		"auth_provider":     "local",
+		"db_type":           utils.GetEnv("DB_TYPE", "postgresql"),
+		"mode":              utils.GetEnv("ROAR_MODE", "api"),
 		// Secret webhook URL is never returned on this public endpoint — only
 		// whether one is configured (the raw value carries a Discord/Slack token).
 		"monitor_webhook_set": strings.TrimSpace(os.Getenv("MONITOR_WEBHOOK_URL")) != "",
@@ -91,9 +91,9 @@ func apiConfigHandler(c *gin.Context) {
 		// each is configured. This endpoint is public (read pre-login), so we don't
 		// echo the H1 username value either (it's an identity handle) — just whether
 		// it's set. HackAdvisor's include-native flag is a plain non-secret bool.
-		"h1_username_set":   strings.TrimSpace(os.Getenv("H1_USERNAME")) != "",
-		"h1_token_set":      strings.TrimSpace(os.Getenv("H1_TOKEN")) != "",
-		"bc_token_set":      strings.TrimSpace(os.Getenv("BUGCROWD_TOKEN")) != "",
+		"h1_username_set": strings.TrimSpace(os.Getenv("H1_USERNAME")) != "",
+		"h1_token_set":    strings.TrimSpace(os.Getenv("H1_TOKEN")) != "",
+		"bc_token_set":    strings.TrimSpace(os.Getenv("BUGCROWD_TOKEN")) != "",
 		// hasIntigritiToken accepts both INTIGRITI_TOKEN and the INTIGRITI_API_KEY
 		// alias — a raw INTIGRITI_TOKEN check would wrongly show "not set" when only
 		// the alias is configured (even though Intigriti fetching works fine).
@@ -1988,7 +1988,14 @@ type R2FileInfo struct {
 
 func apiR2Files(c *gin.Context) {
 	if !r2storage.IsEnabled() {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "R2 storage is not enabled"})
+		// R2 is optional. Local scans keep artifacts on disk, so a disabled
+		// backend should not turn the dashboard into an HTTP 503 error state.
+		c.JSON(http.StatusOK, gin.H{
+			"enabled": false,
+			"files":   []R2FileInfo{},
+			"dirs":    []string{},
+			"message": "Cloudflare R2 is not configured; local scan artifacts are still available.",
+		})
 		return
 	}
 

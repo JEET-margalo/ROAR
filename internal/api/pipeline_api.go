@@ -22,6 +22,14 @@ import (
 
 // RootPipelineReq configures an on-demand root-domain pipeline run. Every field
 // is optional; sensible defaults are applied.
+type ProgramPipelineReq struct {
+	Platform string `json:"platform"`
+	ID       string `json:"id"`
+	Handle   string `json:"handle"`
+	URL      string `json:"url"`
+	Template string `json:"template"`
+}
+
 type RootPipelineReq struct {
 	// Template: a nuclei template path/ID or raw YAML. Empty = the built-in default
 	// (the operator's ~/nuclei-templates-custom dir if present, else http/cves).
@@ -94,15 +102,55 @@ func apiRunRootPipeline(c *gin.Context) {
 	})
 
 	go RunScanInProcess(scanID, scanType, label, func() error {
-		return runRootPipeline(scanID, req.Template, newOnly, threads, req.MaxRoots, req.CollectOnly)
+		return runRootPipeline(scanID, req.Template, newOnly, threads, req.MaxRoots, req.CollectOnly, nil)
 	})
 }
 
-func runRootPipeline(scanID, template string, newOnly bool, threads, maxRoots int, collectOnly bool) error {
+// apiRunProgramPipeline runs only against server-resolved in-scope assets.
+// It never trusts a client-provided target list and never submits reports.
+func apiRunProgramPipeline(c *gin.Context) {
+	_ = db.Init()
+	_ = db.EnsureSchema()
+	var req ProgramPipelineReq
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Platform) == "" || strings.TrimSpace(req.Handle) == "" {
+		c.JSON(400, gin.H{"error": "platform and handle are required"})
+		return
+	}
+	assets, err := programScopeAssets(req.Platform, req.ID, req.Handle, req.URL)
+	if err != nil {
+		c.JSON(502, gin.H{"error": err.Error()})
+		return
+	}
+	roots := scopemod.ScopeElementRoots(scopeElementsFromAssets(assets))
+	if len(roots) == 0 {
+		c.JSON(422, gin.H{"error": "no in-scope root domains were returned for this program"})
+		return
+	}
+	scanID := "program-" + time.Now().Format("20060102150405")
+	c.JSON(202, gin.H{"status": "started", "scan_id": scanID, "program": req.Handle, "roots": len(roots), "message": "Scoped pipeline started. Review findings manually before reporting."})
+	go RunScanInProcess(scanID, "pipeline", "program-pipeline", func() error {
+		return runRootPipeline(scanID, req.Template, true, 20, 0, false, roots)
+	})
+}
+
+func scopeElementsFromAssets(assets []string) []scope.ScopeElement {
+	out := make([]scope.ScopeElement, 0, len(assets))
+	for _, asset := range assets {
+		if strings.TrimSpace(asset) != "" {
+			out = append(out, scope.ScopeElement{Target: asset})
+		}
+	}
+	return out
+}
+
+func runRootPipeline(scanID, template string, newOnly bool, threads, maxRoots int, collectOnly bool, scopedRoots []string) error {
 	stdLog(scanID, "[INFO] Gathering root domains from all bug-bounty platforms…")
 	utils.SendMonitorWebhook(" **Root Pipeline started** — gathering root domains from all platforms…")
 
-	roots := gatherAllPlatformRoots()
+	roots := scopedRoots
+	if roots == nil {
+		roots = gatherAllPlatformRoots()
+	}
 	if len(roots) == 0 {
 		return fmt.Errorf("no root domains found — configure platform API keys in Settings, or add domains first")
 	}

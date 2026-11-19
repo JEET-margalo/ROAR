@@ -34,7 +34,9 @@ func DetectTech(domain string, threads int) (*Result, error) {
 	}
 
 	resultsDir := utils.GetResultsDir()
-	domainDir := filepath.Join(resultsDir, domain)
+	// Use the same sanitized target segment as the other scanners. Raw URLs
+	// contain ':' and '/' which produce invalid Windows paths (e.g. http::).
+	domainDir := filepath.Join(resultsDir, utils.SanitizeTargetSegment(domain))
 	subsDir := filepath.Join(domainDir, "subs")
 	subsFile := filepath.Join(subsDir, "live-subs.txt")
 	outFile := filepath.Join(subsDir, "tech-detect.txt")
@@ -102,15 +104,15 @@ func DetectTech(domain string, threads int) (*Result, error) {
 
 	// Configure httpx options for tech detection
 	options := runner.Options{
-		InputTargetHost: targets,
-		Threads:        threads,
-		TechDetect:     true,
-		ExtractTitle:   true,
-		StatusCode:     true,
-		OutputServerHeader: true,
-		NoColor:        true,
-		Silent:         true,
-		FollowRedirects: true,
+		InputTargetHost:     targets,
+		Threads:             threads,
+		TechDetect:          true,
+		ExtractTitle:        true,
+		StatusCode:          true,
+		OutputServerHeader:  true,
+		NoColor:             true,
+		Silent:              true,
+		FollowRedirects:     true,
 		FollowHostRedirects: true,
 	}
 
@@ -135,8 +137,8 @@ func DetectTech(domain string, threads int) (*Result, error) {
 
 	// techResult is a structured finding for the dashboard (recon / assets table).
 	type techResult struct {
-		URL          string   `json:"matched-at"`   // TARGET column
-		TemplateID   string   `json:"template-id"`  // VULN TYPE column (tech summary)
+		URL          string   `json:"matched-at"`  // TARGET column
+		TemplateID   string   `json:"template-id"` // VULN TYPE column (tech summary)
 		Severity     string   `json:"severity"`
 		StatusCode   int      `json:"status_code"`
 		Title        string   `json:"title,omitempty"`
@@ -187,14 +189,14 @@ func DetectTech(domain string, threads int) (*Result, error) {
 				WebServer:    result.WebServer,
 				Technologies: result.Technologies,
 			})
-			
+
 			// Also sync to core database Subdomains table (tech, title, status, isLive)
 			subhost := result.URL
 			if parsed, err := url.Parse(result.URL); err == nil && parsed.Hostname() != "" {
 				subhost = parsed.Hostname()
 			}
 			go db.UpdateSubdomainFull(domain, subhost, strings.Join(result.Technologies, ","), result.Title, result.StatusCode, true)
-			
+
 			mu.Unlock()
 		}
 	}

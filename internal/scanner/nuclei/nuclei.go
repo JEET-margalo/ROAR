@@ -3,8 +3,8 @@ package nuclei
 import (
 	"context"
 	"fmt"
-	"html"
 	"github.com/h0tak88r/ROAR/internal/logger"
+	"html"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -79,7 +79,7 @@ func RunNuclei(opts Options) (*Result, error) {
 
 		// Extract domain from URL for directory structure
 		extractedDomain := extractDomainFromURL(opts.URL)
-		domainDir := filepath.Join(resultsDir, extractedDomain)
+		domainDir := filepath.Join(resultsDir, utils.SanitizeTargetSegment(extractedDomain))
 		outputDir = filepath.Join(domainDir, "vulnerabilities")
 		if err := utils.EnsureDir(outputDir); err != nil {
 			return nil, fmt.Errorf("failed to create output dir: %w", err)
@@ -97,8 +97,6 @@ func RunNuclei(opts Options) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		
-
 
 		// Index each JSONL result file into the scan directory so the dashboard can find them.
 		// We preserve the nuclei JSONL format rather than re-wrapping lines, so template-id,
@@ -215,8 +213,6 @@ func RunNuclei(opts Options) (*Result, error) {
 			_ = utils.WriteNoFindingsJSON(scanID, targetName, "nuclei", "nuclei-results.json")
 		}
 	}
-
-
 
 	return &Result{TargetName: targetName, Mode: opts.Mode, ResultFiles: resultFiles}, nil
 }
@@ -425,7 +421,7 @@ func runDefaultLoginsScan(targetFile, outputDir string, threads int, targetName,
 	logger.GetLogger().Infof("[INFO] === Running Default Logins scan ===")
 	var resultFiles []string
 
-		// Custom default logins templates
+	// Custom default logins templates
 	customDir := filepath.Join(root, "nuclei_templates", "default-logins")
 	if dirExists(customDir) {
 		logger.GetLogger().Infof("[INFO] Scanning with custom default logins templates...")

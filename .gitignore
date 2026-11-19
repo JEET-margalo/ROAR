@@ -122,3 +122,6 @@ Rules.ymlsupabase_export.sql
 # Local SQLite runtime files
 *.db-shm
 *.db-wal
+
+# Temporary editor/backup files
+*~

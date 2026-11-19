@@ -44,9 +44,9 @@ type ProgramSummary struct {
 	LatestTargetBrief     string       `json:"latest_target_brief"`      // brief context for the latest target
 	UpdatedAt             string       `json:"updated_at"`               // when we last fetched this
 	Stats                 ProgramStats `json:"stats"`
-	Assets                []string     `json:"-"`                        // all in-scope asset identifiers (internal, for scope-change monitoring)
+	Assets                []string     `json:"-"`                           // all in-scope asset identifiers (internal, for scope-change monitoring)
 	ExternalPlatform      string       `json:"external_platform,omitempty"` // real platform for aggregator sources (e.g. "Immunefi" for Platform=="ha")
-	Sources               []string     `json:"sources,omitempty"`        // account label(s) that can see this program (multi-account)
+	Sources               []string     `json:"sources,omitempty"`           // account label(s) that can see this program (multi-account)
 }
 
 // mergeProgramsByHandle appends src programs into dst, deduping by (platform,
@@ -942,6 +942,47 @@ func intigritiToken() string {
 		return t
 	}
 	return strings.TrimSpace(os.Getenv("INTIGRITI_API_KEY"))
+}
+
+// programScopeAssets resolves scope server-side for the selected program.
+// This prevents callers from injecting out-of-scope targets through the UI.
+func programScopeAssets(platform, id, handle, programURL string) ([]string, error) {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	switch platform {
+	case "it", "intigriti":
+		for _, a := range accounts.For("it") {
+			if id == "" || a.Token == "" {
+				continue
+			}
+			s := fetchITScopeSummary(&http.Client{Timeout: 20 * time.Second}, a.Token, id)
+			if len(s.Assets) > 0 {
+				return s.Assets, nil
+			}
+		}
+	case "h1", "hackerone":
+		for _, a := range accounts.For("h1") {
+			if a.Username == "" || a.Token == "" {
+				continue
+			}
+			auth := base64.StdEncoding.EncodeToString([]byte(a.Username + ":" + a.Token))
+			if s, ok := fetchH1ScopeSummary(handle, auth); ok && len(s.Assets) > 0 {
+				return s.Assets, nil
+			}
+		}
+	case "bc", "bugcrowd":
+		for _, a := range accounts.For("bc") {
+			if a.Token == "" {
+				continue
+			}
+			s := fetchBCScopeSummary(handle, programURL, a.Token)
+			if len(s.Assets) > 0 {
+				return s.Assets, nil
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unsupported program platform: %s", platform)
+	}
+	return nil, fmt.Errorf("no accessible in-scope assets returned for %s/%s", platform, handle)
 }
 
 func hasIntigritiToken() bool { return intigritiToken() != "" }

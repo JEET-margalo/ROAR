@@ -71,6 +71,21 @@
     return `${String(p.platform || '').toLowerCase()}:${String(p.handle || '').toLowerCase()}`;
   }
 
+  async function runProgramPipeline(key) {
+    const p = programsData.find((item) => programKey(item) === key);
+    if (!p) return;
+    if (!window.confirm(`Run scoped security testing for ${p.name}? Only server-resolved in-scope assets will be scanned. Reports must be reviewed and submitted manually.`)) return;
+    try {
+      const res = await window.apiPost('/api/pipeline/program-scan', {
+        platform: p.platform, id: p.id, handle: p.handle, url: p.url,
+      });
+      window.showToast('success', 'Scoped pipeline started', `${res.roots || 0} root(s). Review findings before reporting.`);
+      if (window.navigateTo) window.navigateTo('scans');
+    } catch (e) {
+      window.showToast('error', 'Scoped scan failed', e.message || String(e));
+    }
+  }
+
   function renderStats(hydrating = false) {
     const statsBar = document.getElementById('programs-stats-bar');
     if (!statsBar) return;
@@ -397,6 +412,7 @@
           <a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:#fff;text-decoration:none;font-weight:600;font-size:13px;" onmouseenter="this.style.textDecoration='underline'" onmouseleave="this.style.textDecoration='none'">${esc(p.name)}</a>
           <div style="font-size:10px;color:rgba(255,255,255,0.35);display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <span>${esc(p.handle)}</span>
+            <button type="button" onclick="event.stopPropagation();window.ProgramsPage.runProgramPipeline('${esc(programKey(p))}')" style="padding:2px 7px;border:1px solid rgba(245,158,11,.35);border-radius:5px;background:rgba(245,158,11,.08);color:#fbbf24;font-size:10px;cursor:pointer;">Run scoped test</button>
             ${p.external_platform ? `<span style="padding:1px 6px;border-radius:4px;background:rgba(244,114,182,0.12);color:#f9a8d4;border:1px solid rgba(244,114,182,0.25);font-size:9px;font-weight:600;">${esc(p.external_platform)}</span>` : ''}
           </div>
         </td>
@@ -468,5 +484,5 @@
     }
   }
 
-  window.ProgramsPage = { loadPrograms, renderPrograms, onSearch, setSort, refreshNow, testWatch };
+  window.ProgramsPage = { loadPrograms, renderPrograms, onSearch, setSort, refreshNow, testWatch, runProgramPipeline };
 })();
