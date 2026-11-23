@@ -194,6 +194,35 @@
 
       const manifestCard = renderScanManifestCard(manifestResp?.manifest || null, scan);
 
+      // Coverage card: make a zero-finding result explain what the scan actually
+      // learned, especially for SPAs where the homepage is not the whole app.
+      let coverageCard = '';
+      const spaFile = files.find((f) => String(f.file_name || '').toLowerCase() === 'spa-profile.json');
+      const headlessFile = files.find((f) => String(f.file_name || '').toLowerCase() === 'headless-endpoints.json');
+      if (spaFile || headlessFile) {
+        let spaText = 'SPA profile pending';
+        let endpointText = 'Endpoint discovery pending';
+        try {
+          if (spaFile) {
+            const d = await apiFetch(`/api/scans/${encodeURIComponent(scanId)}/results/file?file_name=${encodeURIComponent(spaFile.file_name)}&page=1&per_page=20`);
+            const raw = Array.isArray(d.lines) ? d.lines.join('\\n') : '';
+            const p = raw ? JSON.parse(raw) : null;
+            if (p) spaText = p.spa_fallback ? 'SPA fallback detected' : 'No SPA fallback detected';
+          }
+          if (headlessFile) {
+            const d = await apiFetch(`/api/scans/${encodeURIComponent(scanId)}/results/file?file_name=${encodeURIComponent(headlessFile.file_name)}&page=1&per_page=20`);
+            const raw = Array.isArray(d.lines) ? d.lines.join('\\n') : '';
+            const h = raw ? JSON.parse(raw) : null;
+            if (h) endpointText = `${Array.isArray(h.endpoints) ? h.endpoints.length : 0} same-origin requests discovered`;
+          }
+        } catch (_) { /* the raw artifacts remain available below */ }
+        coverageCard = `<div class="modern-card" style="padding:16px 18px;border-color:rgba(56,189,248,.28);background:rgba(14,165,233,.045);margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><span style="font-size:16px">◎</span><strong style="color:var(--text-primary)">Coverage snapshot</strong><span class="badge" style="margin-left:auto;background:rgba(56,189,248,.12);color:#7dd3fc">read-only discovery</span></div>
+          <div style="display:flex;gap:18px;flex-wrap:wrap;color:var(--text-secondary);font-size:12px"><span><b style="color:var(--text-primary)">${esc(spaText)}</b><br><small>route behavior</small></span><span><b style="color:var(--text-primary)">${esc(endpointText)}</b><br><small>headless network capture</small></span></div>
+          <div style="margin-top:10px;color:var(--text-muted);font-size:11px">Zero findings means zero confirmed matches in the modules that ran—not proof that the application is secure.</div>
+        </div>`;
+      }
+
       let emptyBanner = '';
       if (!files.length) {
         let emptyMsg;
@@ -216,6 +245,7 @@
           <div class="scan-detail-modern">
             ${zipBanner}
             ${manifestCard}
+            ${coverageCard}
             ${emptyBanner}
             <div class="modern-card" style="padding:20px">
               <div style="text-align:center;color:var(--text-muted)">No files to preview.</div>
@@ -226,6 +256,7 @@
           <div class="scan-detail-modern">
             ${zipBanner}
             ${manifestCard}
+            ${coverageCard}
             ${emptyBanner}
             
             <div class="modern-card">

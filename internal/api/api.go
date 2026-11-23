@@ -489,6 +489,7 @@ func SetupAPI() *gin.Engine {
 	r.Use(corsMiddleware())
 
 	auth := supabaseJWTAuth()
+	r.GET("/log", auth, apiExportWebsiteLog)
 
 	// Root: serve dashboard UI by default.
 	r.GET("/", serveDashboardUI)
@@ -551,6 +552,7 @@ func SetupAPI() *gin.Engine {
 		apiGroup.GET("/scans/:id/logs", apiGetScanPhaseLogs)
 		apiGroup.GET("/scans/:id", apiGetScan)
 		apiGroup.GET("/scans/:id/report", apiGetScanReport)
+		apiGroup.POST("/scans/:id/ai-analysis", apiAnalyzeScanWithAI)
 		apiGroup.GET("/scans/:id/logs/stream", apiStreamScanLogs)
 		apiGroup.POST("/scans/bulk-delete", apiBulkDeleteScans)
 		apiGroup.POST("/scans/clear-all", apiClearAllScans)
@@ -606,6 +608,9 @@ func SetupAPI() *gin.Engine {
 		apiGroup.GET("/keyhacks/search", apiSearchKeyhacks)
 		// System & Templates
 		apiGroup.GET("/system/metrics", apiGetSystemMetrics)
+		apiGroup.POST("/ui/logs", apiAppendWebsiteLog)
+		apiGroup.GET("/ui/logs", apiListWebsiteLogs)
+		apiGroup.GET("/ui/logs/export", apiExportWebsiteLog)
 		apiGroup.GET("/system/limits", apiGetRuntimeLimits)
 		apiGroup.GET("/nuclei/templates", apiListNucleiTemplates)
 		// Security Lab — JWT HMAC secret brute-force (client-side analyzer calls this)

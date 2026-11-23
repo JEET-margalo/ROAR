@@ -80,9 +80,13 @@ func apiConfigHandler(c *gin.Context) {
 		// Secret webhook URL is never returned on this public endpoint — only
 		// whether one is configured (the raw value carries a Discord/Slack token).
 		"monitor_webhook_set": strings.TrimSpace(os.Getenv("MONITOR_WEBHOOK_URL")) != "",
-		"monitor_ai_available": strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "" ||
+		"monitor_ai_available": strings.TrimSpace(os.Getenv("ROAR_AI_API_KEY")) != "" ||
+			strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "" ||
 			strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")) != "" ||
 			strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) != "",
+		"roar_ai_key_set":      strings.TrimSpace(os.Getenv("ROAR_AI_API_KEY")) != "",
+		"roar_ai_endpoint_set": strings.TrimSpace(os.Getenv("ROAR_AI_ENDPOINT")) != "",
+		"roar_ai_model":        strings.TrimSpace(os.Getenv("ROAR_AI_MODEL")),
 		// AI provider status — keys are never returned, only whether each is configured.
 		"opencode_key_set":   strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")) != "",
 		"openrouter_key_set": strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "",

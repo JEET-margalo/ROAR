@@ -56,6 +56,7 @@
       case 'report-templates': window.renderReportTemplates(); break;
       case 'r2': window.loadR2(state.r2.prefix); break;
       case 'settings': window.loadConfig(); break;
+      case 'website-logs': window.WebsiteLogsPage?.load(); break;
       case 'scan-detail':
         if (state.scanDetailId) {
           state.scanDetailUI.filesPage = 1;

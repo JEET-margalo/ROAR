@@ -55,6 +55,12 @@ const (
 	// an OpenAI-compatible /v1/chat/completions endpoint.
 	DefaultOpenCodeModel = "deepseek-v4-flash-free"
 
+	// Generic OpenAI-compatible provider. Set ROAR_AI_API_KEY,
+	// ROAR_AI_ENDPOINT, and ROAR_AI_MODEL for providers such as a custom
+	// GPT-compatible gateway (including GPT 5.6 Luna deployments).
+	OpenAICompatibleDefaultEndpoint = "https://api.openai.com/v1/chat/completions"
+	OpenAICompatibleDefaultModel    = "gpt-4o-mini"
+
 	OpenRouterEndpoint   = "https://openrouter.ai/api/v1/chat/completions"
 	OpenCodeEndpoint     = "https://opencode.ai/zen/v1/chat/completions"
 	GeminiDirectEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
@@ -81,14 +87,15 @@ func openCodeModel() string {
 
 // hasAnyAIKey reports whether any supported AI provider key is configured.
 func hasAnyAIKey() bool {
-	return strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "" ||
+	return strings.TrimSpace(os.Getenv("ROAR_AI_API_KEY")) != "" ||
+		strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "" ||
 		strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")) != "" ||
 		strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) != "" ||
 		strings.TrimSpace(os.Getenv("ZHIPU_API_KEY")) != ""
 }
 
 // errNoAIKey is the standard error message when no AI key is available.
-const errNoAIKey = "no AI key set: configure OPENCODE_API_KEY (free), OPENROUTER_API_KEY, GEMINI_API_KEY, or ZHIPU_API_KEY"
+const errNoAIKey = "no AI key set: configure ROAR_AI_API_KEY (+ ROAR_AI_ENDPOINT/ROAR_AI_MODEL), OPENCODE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, or ZHIPU_API_KEY"
 
 // ─── Agent Loop types ─────────────────────────────────────────────────────────
 
@@ -507,6 +514,14 @@ func callAI(prompt, orKey, geminiKey string) (string, error) {
 	zaiKey := strings.TrimSpace(os.Getenv("ZHIPU_API_KEY"))
 
 	var errs []string
+	genericKey := strings.TrimSpace(os.Getenv("ROAR_AI_API_KEY"))
+	if genericKey != "" {
+		res, err := callOpenAICompatible([]Message{{Role: "user", Content: prompt}}, genericKey)
+		if err == nil {
+			return res, nil
+		}
+		errs = append(errs, "ROAR_AI: "+err.Error())
+	}
 	if ocKey != "" {
 		res, err := callOpenCode(prompt, ocKey)
 		if err == nil {
@@ -695,6 +710,14 @@ func ChatWithAI(history []Message, userMessage string, systemPrompt string) (str
 	messages = append(messages, Message{Role: "user", Content: userMessage})
 
 	var errs []string
+	genericKey := strings.TrimSpace(os.Getenv("ROAR_AI_API_KEY"))
+	if genericKey != "" {
+		res, err := callOpenAICompatible(messages, genericKey)
+		if err == nil {
+			return res, nil
+		}
+		errs = append(errs, "ROAR_AI: "+err.Error())
+	}
 	if openCodeKey != "" {
 		res, err := callOpenCodeMulti(messages, openCodeKey)
 		if err == nil {
@@ -735,6 +758,49 @@ func ChatWithAI(history []Message, userMessage string, systemPrompt string) (str
 		return "", fmt.Errorf("%s", errNoAIKey)
 	}
 	return "", fmt.Errorf("all configured AI providers failed — %s", strings.Join(errs, " | "))
+}
+
+// callOpenAICompatible calls a configurable OpenAI-compatible chat endpoint.
+// It intentionally supports only chat completions and never executes model output.
+func callOpenAICompatible(messages []Message, apiKey string) (string, error) {
+	endpoint := strings.TrimSpace(os.Getenv("ROAR_AI_ENDPOINT"))
+	if endpoint == "" {
+		endpoint = OpenAICompatibleDefaultEndpoint
+	}
+	model := strings.TrimSpace(os.Getenv("ROAR_AI_MODEL"))
+	if model == "" {
+		model = OpenAICompatibleDefaultModel
+	}
+	body, err := json.Marshal(OpenRouterRequest{Model: model, Messages: messages})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := utils.CreateCustomHTTPClient(90 * time.Second).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("AI endpoint error %d: %s", resp.StatusCode, string(data))
+	}
+	var parsed OpenRouterResponse
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.Error != nil {
+		return "", fmt.Errorf("AI endpoint error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("AI endpoint returned no choices")
+	}
+	return parsed.Choices[0].Message.Content, nil
 }
 
 // callOpenRouterMulti sends a multi-message conversation to OpenRouter

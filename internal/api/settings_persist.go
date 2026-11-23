@@ -20,6 +20,7 @@ import (
 // and are resolved directly from the DB via utils.GetTimeout.
 var persistedEnvKeys = []string{
 	"MONITOR_WEBHOOK_URL",
+	"ROAR_AI_API_KEY", "ROAR_AI_ENDPOINT", "ROAR_AI_MODEL",
 	"OPENROUTER_API_KEY", "OPENCODE_API_KEY", "GEMINI_API_KEY",
 	"OPENROUTER_MODEL", "OPENCODE_MODEL",
 	"H1_USERNAME", "H1_TOKEN",

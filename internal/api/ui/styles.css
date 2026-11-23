@@ -4176,3 +4176,50 @@ select.input {
   cursor: pointer;
 }
 .acct-testall:hover { color: var(--accent-cyan); border-color: var(--accent-cyan-dim, var(--accent-cyan)); }
+
+.website-log-list { display:flex; flex-direction:column; gap:8px; max-height:65vh; overflow:auto; }
+.website-log-entry { padding:12px 14px; border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.02); }
+.website-log-meta { display:flex; align-items:center; gap:10px; margin-bottom:7px; color:var(--text-muted); font-size:11px; }
+.website-log-meta time { font-family:'JetBrains Mono',monospace; }
+.website-log-entry pre { margin:0; white-space:pre-wrap; word-break:break-word; color:var(--text-secondary); font:12px/1.5 'JetBrains Mono',monospace; }
+.website-log-source { margin-top:7px; color:var(--text-muted); font-size:11px; }
+
+/* Unslop polish: quiet chrome, one restrained accent, and consistent rhythm.
+   Adapted from heydamir/unslop (CC BY 4.0; credit: Damir Sokolovsky). */
+.logo-icon {
+  background: var(--accent-cyan);
+  box-shadow: none;
+}
+.logo-text {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: var(--text-primary);
+}
+.nav-section-label,
+.section-label,
+.card-kicker {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.btn-primary {
+  background: var(--accent-cyan);
+  box-shadow: none;
+}
+.btn-primary:hover {
+  background: #0891b2;
+  box-shadow: none;
+}
+.modern-card,
+.card,
+.stat-card {
+  box-shadow: 0 2px 12px rgba(0,0,0,.18);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}

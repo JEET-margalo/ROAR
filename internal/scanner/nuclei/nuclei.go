@@ -2,6 +2,7 @@ package nuclei
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/h0tak88r/ROAR/internal/logger"
 	"html"
@@ -10,8 +11,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/h0tak88r/ROAR/internal/scanner/headless"
 	"github.com/h0tak88r/ROAR/internal/scanner/livehosts"
+	"github.com/h0tak88r/ROAR/internal/scanner/spa"
 	"github.com/h0tak88r/ROAR/internal/scanner/subdomains"
 	"github.com/h0tak88r/ROAR/internal/utils"
 	nucleiSDK "github.com/projectdiscovery/nuclei/v3/lib"
@@ -92,7 +96,47 @@ func RunNuclei(opts Options) (*Result, error) {
 		}
 		defer os.Remove(targetFile)
 
-		logger.GetLogger().Infof("[INFO] Running Nuclei in %s mode on single URL", opts.Mode)
+		logger.GetLogger().Infof("[INFO] Detecting SPA fallback behavior before Nuclei")
+		spaProfile := spa.Detect(opts.URL)
+		logger.GetLogger().Infof("[INFO] Running bounded headless crawl for SPA/API discovery")
+		headlessResult := headless.Crawl(opts.URL, 30*time.Second)
+		// Feed discovered same-origin API requests into Nuclei. Keep the
+		// homepage, but exclude assets and non-GET requests.
+		targets := []string{opts.URL}
+		seenTargets := map[string]bool{opts.URL: true}
+		for _, endpoint := range headlessResult.URLs {
+			if endpoint.Method != "GET" || !headless.IsAPIEndpoint(endpoint.URL) || seenTargets[endpoint.URL] {
+				continue
+			}
+			seenTargets[endpoint.URL] = true
+			targets = append(targets, endpoint.URL)
+		}
+		logger.GetLogger().Infof("[INFO] Discovered %d same-origin API targets", len(targets)-1)
+		if len(targets) > 1 {
+			if writeErr := utils.WriteLines(targetFile, targets); writeErr != nil {
+				logger.GetLogger().Infof("[WARN] Could not write discovered API targets: %v", writeErr)
+			}
+		}
+		if scanID := utils.GetCurrentScanID(); scanID != "" {
+			if endpointJSON, marshalErr := json.MarshalIndent(headlessResult, "", "  "); marshalErr == nil {
+				_ = utils.WriteFile(filepath.Join(utils.GetScanResultsDir(scanID), "headless-endpoints.json"), endpointJSON)
+			}
+			if len(targets) > 1 {
+				artifactPath := filepath.Join(utils.GetScanResultsDir(scanID), "api-endpoints.txt")
+				_ = os.MkdirAll(filepath.Dir(artifactPath), 0755)
+				_ = os.WriteFile(artifactPath, []byte(strings.Join(targets[1:], "\n")+"\n"), 0644)
+				if _, idxErr := utils.IndexExistingResultFile(scanID, artifactPath); idxErr != nil {
+					logger.GetLogger().Infof("[WARN] Could not index discovered API targets: %v", idxErr)
+				}
+			}
+		}
+		if scanID := utils.GetCurrentScanID(); scanID != "" {
+			if profileJSON, marshalErr := json.MarshalIndent(spaProfile, "", "  "); marshalErr == nil {
+				profilePath := filepath.Join(utils.GetScanResultsDir(scanID), "spa-profile.json")
+				_ = utils.WriteFile(profilePath, profileJSON)
+			}
+		}
+		logger.GetLogger().Infof("[INFO] Running Nuclei in %s mode against %d discovered targets", opts.Mode, len(targets))
 		resultFiles, err := runNucleiScan(targetFile, outputDir, opts.Mode, opts.Threads, targetName, root)
 		if err != nil {
 			return nil, err
@@ -503,7 +547,9 @@ func runVulnerabilitiesScan(targetFile, outputDir string, threads int, targetNam
 
 // runNucleiCommand runs nuclei with JSONL output (-json flag).
 // Each line of the output file is a self-contained JSON object with fields:
-//   template-id, matched-at, info.severity, info.name, host, etc.
+//
+//	template-id, matched-at, info.severity, info.name, host, etc.
+//
 // This lets the dashboard parse clean vulnerability names instead of raw text.
 func runNucleiCommand(targetFile, templateDir string, threads int, outputFile string) error {
 	targets, err := readTargetLines(targetFile)
